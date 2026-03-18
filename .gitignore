@@ -205,3 +205,15 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+related_work/
+
+# API keys
+api_key_apiyi.txt
+api_key_serpapi.txt
+*.key
+
+# Generated skill libraries and outputs
+expr/
+outputs/
+data/
+dataset/
