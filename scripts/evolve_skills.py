@@ -102,7 +102,7 @@ async def evolve(
     print(f"[HyperSkill] Dataset: {len(dataset)} samples, {len(loader)} batches/epoch")
 
     trainer = HyperSkillGRPOTrainer(cfg)
-    if resume and not reset:
+    if resume:
         print(f"[HyperSkill] Resuming from: {cfg.hypergraph.working_dir}")
     print(f"[HyperSkill] Skill library: {trainer.skill_library.stats()}")
 

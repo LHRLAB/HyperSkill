@@ -429,21 +429,36 @@ class HyperSkillGRPOTrainer:
         Tools are determined by dataset type (see agents/tools.py).
         Skills are re-injected at each search turn for context-adaptive augmentation.
         """
-        from ..llm import async_llm_call, async_llm_call_with_images
+        from ..llm import async_llm_call, async_llm_call_with_media
         from ..agents.tools import build_tools, format_available_tools
         from ..prompts import format_skills_context, AFTER_SEARCH_PROMPT
         import base64
 
         prompt = initial_prompt
         response_list: List[str] = []
-        image_b64_list = [
-            base64.b64encode(img).decode("utf-8") for img in (item.images or [])
-        ]
+        image_b64_list: List[str] = []
+        audio_bytes: Optional[bytes] = None
+        audio_fmt = "wav"
 
-        # For Omni: extract video keyframes as images
-        if item.video_path and not image_b64_list:
-            keyframes = _extract_keyframes(item.video_path, max_frames=3)
-            image_b64_list.extend(keyframes)
+        rtype = getattr(item, "resource_type", "none")
+
+        if rtype == "image":
+            image_b64_list = [base64.b64encode(img).decode("utf-8") for img in (item.images or [])]
+
+        elif rtype == "video":
+            keyframes = _extract_keyframes(item.video_path, max_frames=3) if item.video_path else []
+            image_b64_list = keyframes
+
+        elif rtype == "audio":
+            audio_bytes = item.audio
+            if item.resource_paths:
+                for rp in item.resource_paths:
+                    ext = rp.rsplit(".", 1)[-1].lower() if "." in rp else "wav"
+                    if ext in ("wav", "mp3", "flac", "m4a", "ogg"):
+                        audio_fmt = ext
+                        break
+
+        # rtype "pdf" and "none": no media to send to LLM
 
         # Build tools for this item's dataset type
         tools = build_tools(
@@ -460,13 +475,17 @@ class HyperSkillGRPOTrainer:
 
         for round_idx in range(max_rounds):
             # Generate next response
-            if image_b64_list:
-                response = await async_llm_call_with_images(
+            if image_b64_list or audio_bytes:
+                response = await async_llm_call_with_media(
                     prompt=prompt,
                     image_b64_list=image_b64_list,
                     cfg=self._llm_cfg,
+                    audio_bytes=audio_bytes,
+                    audio_fmt=audio_fmt,
                     max_tokens=self.cfg.rollout.max_new_tokens,
                 )
+                # Only send audio on the first round (context is in the conversation history)
+                audio_bytes = None
             else:
                 response = await async_llm_call(
                     prompt=prompt,

@@ -325,6 +325,66 @@ async def async_llm_call_with_images(
     return await _run_in_executor(fn)
 
 
+def sync_llm_call_with_media(
+    prompt: str,
+    image_b64_list: List[str],
+    cfg: LLMConfig,
+    audio_bytes: Optional[bytes] = None,
+    audio_fmt: str = "wav",
+    system: str = "You are a helpful assistant.",
+    max_tokens: Optional[int] = None,
+) -> str:
+    """
+    Chat completion with images and/or audio.
+    Audio is sent as an 'input_audio' content part (Gemini via apiyi).
+    """
+    client = _get_client(cfg)
+    content: list = []
+    for b64 in image_b64_list:
+        raw = base64.b64decode(b64[:16] + "==")
+        mime = "image/png" if raw[:4] == b"\x89PNG" else "image/jpeg"
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{b64}"},
+        })
+    if audio_bytes:
+        b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
+        content.append({
+            "type": "input_audio",
+            "input_audio": {"data": b64_audio, "format": audio_fmt},
+        })
+    content.append({"type": "text", "text": prompt})
+
+    resp = client.chat.completions.create(
+        model=cfg.model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user",   "content": content},
+        ],
+        max_tokens=max_tokens or cfg.max_tokens,
+        temperature=cfg.temperature,
+    )
+    return resp.choices[0].message.content or ""
+
+
+async def async_llm_call_with_media(
+    prompt: str,
+    image_b64_list: List[str],
+    cfg: LLMConfig,
+    audio_bytes: Optional[bytes] = None,
+    audio_fmt: str = "wav",
+    system: str = "You are a helpful assistant.",
+    max_tokens: Optional[int] = None,
+) -> str:
+    import functools
+    fn = functools.partial(
+        sync_llm_call_with_media, prompt, image_b64_list, cfg,
+        audio_bytes=audio_bytes, audio_fmt=audio_fmt,
+        system=system, max_tokens=max_tokens,
+    )
+    return await _run_in_executor(fn)
+
+
 async def async_embed_texts(texts: List[str], cfg: LLMConfig) -> np.ndarray:
     import functools
     fn = functools.partial(sync_embed_texts, texts, cfg)
