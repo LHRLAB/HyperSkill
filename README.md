@@ -36,10 +36,11 @@ Without a SerpAPI key, web search falls back to skill library retrieval.
 
 ## Evaluation
 
-Two commands reproduce all reported numbers — each runs all 11 datasets in
+Three commands reproduce all reported numbers — each runs all 11 datasets in
 parallel (one subprocess per dataset, logs in `outputs/logs/`):
 
 ```bash
+python run.py --zero-shot  # baseline: frozen LLM, no skill retrieval
 python run.py --train      # self-evolve skill libraries on all 11 datasets
 python run.py --eval       # evaluate skill-augmented policy on all 11 datasets
 ```

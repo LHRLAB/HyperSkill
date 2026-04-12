@@ -1,16 +1,18 @@
 """
 HyperSkill unified launcher.
 
-Two one-line commands reproduce all reported numbers (each runs all 11 datasets
-in parallel, one subprocess per dataset):
+Three one-line commands reproduce all reported numbers (each runs all 11
+datasets in parallel, one subprocess per dataset):
 
+    python run.py --zero-shot      # evaluate frozen LLM without any skills
     python run.py --train          # self-evolve skill libraries on all datasets
     python run.py --eval           # evaluate skill-augmented policy on all datasets
 
 Single-dataset usage:
 
-    python run.py --train --dataset AIME2024
-    python run.py --eval  --dataset OmniVideoBench
+    python run.py --zero-shot --dataset AIME2024
+    python run.py --train     --dataset AIME2024
+    python run.py --eval      --dataset OmniVideoBench
 """
 
 from __future__ import annotations
@@ -55,9 +57,11 @@ def _run_parallel(mode_flag: str, datasets: list[str], extra: list[str]) -> int:
 def main() -> None:
     ap = argparse.ArgumentParser(description="HyperSkill launcher")
     mode = ap.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--train", action="store_true",
+    mode.add_argument("--zero-shot", action="store_true",
+                      help="Evaluate frozen LLM without skill retrieval")
+    mode.add_argument("--train",     action="store_true",
                       help="Self-evolve the skill library")
-    mode.add_argument("--eval",  action="store_true",
+    mode.add_argument("--eval",      action="store_true",
                       help="Evaluate the skill-augmented policy")
     ap.add_argument("--dataset",     default=None,
                     help="Single dataset key (default: all 11 in parallel)")
@@ -68,7 +72,13 @@ def main() -> None:
     ap.add_argument("--split",       default="test")
     args = ap.parse_args()
 
-    mode_flag = "--train" if args.train else "--eval"
+    if args.train:
+        mode_flag = "--train"
+    elif args.eval:
+        mode_flag = "--eval"
+    else:
+        mode_flag = "--zero-shot"
+
     extra: list[str] = []
     if args.train:
         extra += ["--epochs", str(args.epochs), "--batch-size", str(args.batch_size)]

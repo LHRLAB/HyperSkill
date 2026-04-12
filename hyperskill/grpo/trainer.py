@@ -593,14 +593,16 @@ class HyperSkillGRPOTrainer:
     # Evaluation mode
     # ------------------------------------------------------------------
 
-    async def evaluate(self, dataloader) -> Dict[str, float]:
+    async def evaluate(self, dataloader, use_skills: bool = True) -> Dict[str, float]:
         """Run evaluation without skill library updates.
-        Uses test_top_k and test_min_similarity for retrieval quality gating.
+
+        Args:
+            use_skills: if False, run zero-shot (skip skill retrieval entirely).
+                        Otherwise apply test-time retrieval gating
+                        (test_top_k + test_min_similarity).
         """
         all_f1: List[float] = []
-        all_format: List[float] = []
 
-        # Use test-time retrieval parameters (stricter than training)
         hcfg = self.cfg.hypergraph
         eval_top_k = getattr(hcfg, "test_top_k", hcfg.top_k)
         eval_min_sim = getattr(hcfg, "test_min_similarity", 0.0)
@@ -609,7 +611,6 @@ class HyperSkillGRPOTrainer:
 
         async def _eval_one(item, skills):
             async with eval_sem:
-                # Skip summarize_skills (extra LLM call) — just format raw skills
                 prompt = build_skill_augmented_prompt(
                     question=item.question,
                     modality=self.cfg.data.modality,
@@ -629,11 +630,15 @@ class HyperSkillGRPOTrainer:
                 )
 
         for batch in tqdm(dataloader, desc="Evaluating"):
-            queries = [item.question for item in batch]
-            skills_per_query = await self.skill_library.retrieve_for_batch(
-                queries=queries, top_k=eval_top_k,
-                min_similarity=eval_min_sim,
-            )
+            if use_skills:
+                queries = [item.question for item in batch]
+                skills_per_query = await self.skill_library.retrieve_for_batch(
+                    queries=queries, top_k=eval_top_k,
+                    min_similarity=eval_min_sim,
+                )
+            else:
+                skills_per_query = [[] for _ in batch]
+
             scores = await asyncio.gather(*[
                 _eval_one(item, sk) for item, sk in zip(batch, skills_per_query)
             ])
@@ -642,6 +647,7 @@ class HyperSkillGRPOTrainer:
         return {
             "f1": float(np.mean(all_f1)) if all_f1 else 0.0,
             "n_samples": len(all_f1),
+            "use_skills": use_skills,
             **self.skill_library.stats(),
         }
 
