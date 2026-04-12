@@ -38,7 +38,7 @@ async def serpapi_search(
         "num": num_results,
         "engine": "google",
     }
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
         resp = await client.get("https://serpapi.com/search.json", params=params)
         resp.raise_for_status()
         data = resp.json()
@@ -86,7 +86,7 @@ async def serpapi_image_search(
             "num": num_results,
         }
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
         resp = await client.get("https://serpapi.com/search.json", params=params)
         resp.raise_for_status()
         data = resp.json()

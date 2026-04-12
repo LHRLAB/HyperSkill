@@ -37,23 +37,22 @@ from typing import Any, Dict, Iterator, List, Optional
 # ---------------------------------------------------------------------------
 
 # ds_key → folder name under dataset/
-# resource_type: "none" | "image" | "pdf" | "video" | "audio"
 DATASET_KEYS: Dict[str, Dict[str, str]] = {
     # Text ───────────────────────────────────────────────────────────────────
-    "AIME2024":        {"folder": "Text/AIME2024",          "modality": "text", "task_type": "math",        "resource_type": "none"},
-    "AIME2025":        {"folder": "Text/AIME2025",          "modality": "text", "task_type": "math",        "resource_type": "none"},
-    "WebWalkerQA":     {"folder": "Text/WebWalkerQA",       "modality": "text", "task_type": "webagent",    "resource_type": "none"},
+    "AIME2024":        {"folder": "Text/AIME2024",          "modality": "text", "task_type": "math"},
+    "AIME2025":        {"folder": "Text/AIME2025",          "modality": "text", "task_type": "math"},
+    "WebWalkerQA":     {"folder": "Text/WebWalkerQA",       "modality": "text", "task_type": "webagent"},
     # VL · WebSearch ─────────────────────────────────────────────────────────
-    "FVQA":            {"folder": "VL-Web/FVQA",            "modality": "vl",   "task_type": "websearch",   "resource_type": "image"},
-    "InfoSeek":        {"folder": "VL-Web/InfoSeek",        "modality": "vl",   "task_type": "websearch",   "resource_type": "image"},
-    "SimpleVQA":       {"folder": "VL-Web/SimpleVQA",       "modality": "vl",   "task_type": "websearch",   "resource_type": "image"},
-    "LiveVQA":         {"folder": "VL-Web/LiveVQA",         "modality": "vl",   "task_type": "websearch",   "resource_type": "image"},
+    "FVQA":            {"folder": "VL-Web/FVQA",            "modality": "vl",   "task_type": "websearch"},
+    "InfoSeek":        {"folder": "VL-Web/InfoSeek",        "modality": "vl",   "task_type": "websearch"},
+    "SimpleVQA":       {"folder": "VL-Web/SimpleVQA",       "modality": "vl",   "task_type": "websearch"},
+    "LiveVQA":         {"folder": "VL-Web/LiveVQA",         "modality": "vl",   "task_type": "websearch"},
     # VL · Doc ───────────────────────────────────────────────────────────────
-    "DocBench":        {"folder": "VL-Doc/DocBench",        "modality": "vl",   "task_type": "docsearch",   "resource_type": "pdf"},
-    "MMLongBench-Doc": {"folder": "VL-Doc/MMLongBench-Doc", "modality": "vl",   "task_type": "docsearch",   "resource_type": "pdf"},
+    "DocBench":        {"folder": "VL-Doc/DocBench",        "modality": "vl",   "task_type": "mmreasoning"},
+    "MMLongBench-Doc": {"folder": "VL-Doc/MMLongBench-Doc", "modality": "vl",   "task_type": "mmreasoning"},
     # Omni ───────────────────────────────────────────────────────────────────
-    "OmniVideoBench":  {"folder": "Omni/OmniVideoBench",    "modality": "omni", "task_type": "mmreasoning", "resource_type": "video"},
-    "WorldSense":      {"folder": "Omni/WorldSense",        "modality": "omni", "task_type": "mmreasoning", "resource_type": "audio"},
+    "OmniVideoBench":  {"folder": "Omni/OmniVideoBench",    "modality": "omni", "task_type": "mmreasoning"},
+    "WorldSense":      {"folder": "Omni/WorldSense",        "modality": "omni", "task_type": "mmreasoning"},
 }
 
 
@@ -67,19 +66,18 @@ DATASET_ROOT = Path(__file__).parent.parent.parent / "dataset"
 @dataclass
 class DataBatch:
     """A single QA example from any modality."""
-    question:      str
-    gold_answers:  List[str]
-    source:        str               # dataset name (e.g. "FVQA")
-    task_type:     str               # e.g. "websearch", "math", "mmreasoning"
-    modality:      str               # "text", "vl", "omni"
-    resource_type: str               # "none" | "image" | "pdf" | "video" | "audio"
+    question:     str
+    gold_answers: List[str]
+    source:       str               # dataset name (e.g. "FVQA")
+    task_type:    str               # e.g. "websearch", "math", "mmreasoning"
+    modality:     str               # "text", "vl", "omni"
     # resolved file bytes loaded from resource_paths
-    images:        List[bytes]       = field(default_factory=list)
-    audio:         Optional[bytes]   = None
-    video_path:    Optional[str]     = None
-    resource_paths: List[str]        = field(default_factory=list)
-    dataset_dir:   str               = ""  # path to dataset folder (for corpus/media search)
-    metadata:      Dict[str, Any]    = field(default_factory=dict)
+    images:       List[bytes]       = field(default_factory=list)
+    audio:        Optional[bytes]   = None
+    video_path:   Optional[str]     = None
+    resource_paths: List[str]       = field(default_factory=list)
+    dataset_dir:  str               = ""  # path to dataset folder (for corpus/media search)
+    metadata:     Dict[str, Any]    = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -154,53 +152,39 @@ class HyperSkillDataset:
         else:
             gold_answers = []
 
-        source        = str(row.get("data_source", "unknown"))
-        task_type     = str(row.get("task_type",   self._info["task_type"]))
-        modality      = str(row.get("modality",    self._info["modality"]))
-        resource_type = self._info.get("resource_type", "none")
+        source    = str(row.get("data_source", "unknown"))
+        task_type = str(row.get("task_type",   self._info["task_type"]))
+        modality  = str(row.get("modality",    self._info["modality"]))
 
+        # new unified schema: images (list), video (str|None), audio (str|None)
         images:     List[bytes] = []
         audio:      Optional[bytes] = None
         video_path: Optional[str]   = None
         resource_paths: List[str]   = []
 
-        # Only load the media type that this dataset actually uses
-        if resource_type == "image":
-            for rel in (row.get("images") or []):
-                abs_p = self._folder / rel
-                resource_paths.append(rel)
-                if abs_p.exists() and abs_p.suffix.lower() in self.IMAGE_EXTS:
-                    images.append(abs_p.read_bytes())
+        PDF_EXTS = {".pdf"}
+        for rel in (row.get("images") or []):
+            abs_p = self._folder / rel
+            resource_paths.append(rel)
+            if not abs_p.exists():
+                continue
+            # PDFs are handled by DocSearchTool, not sent as images
+            if abs_p.suffix.lower() in PDF_EXTS:
+                continue
+            images.append(abs_p.read_bytes())
 
-        elif resource_type == "pdf":
-            # PDFs are indexed by DocSearchTool — just record the paths
-            for rel in (row.get("images") or []):
-                abs_p = self._folder / rel
-                if abs_p.suffix.lower() == ".pdf":
-                    resource_paths.append(rel)
+        if row.get("video"):
+            rel   = row["video"]
+            abs_p = self._folder / rel
+            video_path = str(abs_p) if abs_p.exists() else None
+            resource_paths.append(rel)
 
-        elif resource_type == "video":
-            rel = row.get("video") or (row.get("images") or [None])[0]
-            if rel:
-                abs_p = self._folder / rel
-                resource_paths.append(rel)
-                if abs_p.exists() and abs_p.suffix.lower() in self.VIDEO_EXTS:
-                    video_path = str(abs_p)
-
-        elif resource_type == "audio":
-            rel = row.get("audio") or (row.get("images") or [None])[0]
-            if rel:
-                abs_p = self._folder / rel
-                resource_paths.append(rel)
-                if abs_p.exists() and abs_p.suffix.lower() in self.AUDIO_EXTS:
-                    try:
-                        raw = abs_p.read_bytes()
-                        # cap at 10 MB to avoid OOM
-                        audio = raw[:10 * 1024 * 1024]
-                    except OSError:
-                        pass
-
-        # resource_type == "none": text-only, nothing to load
+        if row.get("audio"):
+            rel   = row["audio"]
+            abs_p = self._folder / rel
+            if abs_p.exists():
+                audio = abs_p.read_bytes()
+            resource_paths.append(rel)
 
         return DataBatch(
             question=question,
@@ -208,7 +192,6 @@ class HyperSkillDataset:
             source=source,
             task_type=task_type,
             modality=modality,
-            resource_type=resource_type,
             images=images,
             audio=audio,
             video_path=video_path,

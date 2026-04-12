@@ -34,8 +34,6 @@ from ..skill.library import SkillLibrary
 from ..skill.models import SkillNode
 from .rewards import (
     compute_combined_reward,
-    compute_grpo_advantages,
-    compute_grpo_advantages_global,
 )
 
 
@@ -147,9 +145,11 @@ class HyperSkillGRPOTrainer:
             total_format += metrics.get("avg_format", 0.0)
             batch_count += 1
 
+            metric_label = "Acc" if self.cfg.data.dataset_names and \
+                any(n in ("AIME2024", "AIME2025") for n in self.cfg.data.dataset_names) else "F1"
             print(
                 f"[Batch {batch_idx+1}/{total_batches}] "
-                f"F1={metrics['avg_f1']:.4f}  Format={metrics['avg_format']:.4f}  "
+                f"{metric_label}={metrics['avg_f1']:.4f}  Format={metrics['avg_format']:.4f}  "
                 f"SkillInserted={metrics.get('skills_inserted', 0)}  "
                 f"Elapsed={elapsed:.1f}s"
             )
@@ -209,6 +209,7 @@ class HyperSkillGRPOTrainer:
                 queries=queries,
                 top_k=self.cfg.hypergraph.top_k,
                 image_bytes_list=image_bytes_list,
+                min_similarity=getattr(self.cfg.hypergraph, "test_min_similarity", 0.0),
             )
         except Exception as exc:
             logger.warning("Skill retrieval failed: %s — using empty skills", exc)
@@ -216,6 +217,10 @@ class HyperSkillGRPOTrainer:
 
         # -- Step 2: Build augmented prompts and generate rollouts -------
         from ..agents.tools import build_tools, format_available_tools
+
+        # Skip summarize_skills during training — inject raw skills to save LLM calls
+        summary_cache: dict = {}
+
         rollout_prompts = []
         for item, skills in zip(expanded, skills_per_query):
             # Determine available tools for this item and format for prompt
@@ -232,6 +237,7 @@ class HyperSkillGRPOTrainer:
                 task_type=item.task_type,
                 skills=skills,
                 tool_desc=tool_desc,
+                skill_summary=summary_cache.get(item.question),
             )
             rollout_prompts.append(prompt)
 
@@ -264,10 +270,6 @@ class HyperSkillGRPOTrainer:
 
             all_rewards.extend(group_rewards)
 
-            # GRPO advantages (kept for logging / future use)
-            local_advantages = compute_grpo_advantages(group_rewards)
-            self._update_global_stats(group_rewards)
-
             # Collect group for CRUD-based skill evolution
             updater_groups.append({
                 "question": group_items[0].question if group_items else "",
@@ -276,19 +278,33 @@ class HyperSkillGRPOTrainer:
             })
 
         # -- Step 4: CRUD-based skill evolution (TrainingFreeGRPO style) ----
-        try:
-            counts = await self.skill_updater.update(
-                updater_groups, concurrency=4, num_skills=3,
-            )
-            total_inserted = counts.get("added", 0) + counts.get("updated", 0)
-        except Exception as exc:
-            logger.warning("SkillUpdater failed: %s", exc)
+        # F1 threshold gate: only extract skills when scoring is reliable
+        batch_avg_f1 = float(np.mean(all_f1)) if all_f1 else 0.0
+        if batch_avg_f1 >= 0.15:
+            try:
+                counts = await self.skill_updater.update(
+                    updater_groups, concurrency=4, num_skills=3,
+                )
+                total_inserted = counts.get("added", 0) + counts.get("updated", 0)
+            except Exception as exc:
+                logger.warning("SkillUpdater failed: %s", exc)
+                total_inserted = 0
+        else:
             total_inserted = 0
 
         # -- Step 5: Retrieval feedback → advantage update + co-occurrence edges
         self._retrieval_advantage_feedback(
             skills_per_query, all_rewards, n
         )
+
+        # -- Step 6: Prune low-advantage and stale skills
+        builder = self.skill_library.builder
+        builder._update_count += 1
+        prune_every = max(1, self.cfg.hypergraph.prune_interval // 50)  # prune more often
+        if builder._update_count % prune_every == 0:
+            pruned = builder.prune(self.cfg.hypergraph.prune_min_advantage)
+            if pruned > 0:
+                print(f"  [Prune] removed {pruned} low-advantage skills")
 
         # Format score: check all rollouts
         for roll in rollouts:
@@ -369,20 +385,29 @@ class HyperSkillGRPOTrainer:
                     builder.graph.upsert_node(edge_id, advantage=new_adv)
                 else:
                     desc = " + ".join(getattr(s, "name", "?") for s in retrieved[:5])
+                    full_desc = f"Co-occurrence: {desc}"
                     builder.kv_hyperedges.set(edge_id, {
                         "edge_id": edge_id,
-                        "description": f"Co-occurrence: {desc}",
+                        "description": full_desc,
                         "node_ids": skill_ids[:5],
                         "advantage": max(0.0, adv_signal),
                         "edge_type": "cooccurrence",
                     })
                     builder.graph.upsert_node(
                         edge_id, node_type="hyperedge",
-                        description=f"Co-occurrence: {desc}",
+                        description=full_desc,
                         advantage=max(0.0, adv_signal),
                     )
                     for sid in skill_ids[:5]:
                         builder.graph.upsert_edge(edge_id, sid, weight=0.1)
+                    # Write vector to VDB so retrieval can find this hyperedge
+                    if not builder.vdb_hyperedges.has(edge_id):
+                        try:
+                            from ..llm import sync_embed_texts
+                            vecs = sync_embed_texts([full_desc], self._llm_cfg)
+                            builder.vdb_hyperedges.upsert_batch([(edge_id, vecs[0])])
+                        except Exception as _exc:
+                            logger.warning("Co-occurrence hyperedge VDB embed failed: %s", _exc)
 
     # ------------------------------------------------------------------
     # Rollout generation
@@ -429,36 +454,21 @@ class HyperSkillGRPOTrainer:
         Tools are determined by dataset type (see agents/tools.py).
         Skills are re-injected at each search turn for context-adaptive augmentation.
         """
-        from ..llm import async_llm_call, async_llm_call_with_media
+        from ..llm import async_llm_call, async_llm_call_with_images
         from ..agents.tools import build_tools, format_available_tools
         from ..prompts import format_skills_context, AFTER_SEARCH_PROMPT
         import base64
 
         prompt = initial_prompt
         response_list: List[str] = []
-        image_b64_list: List[str] = []
-        audio_bytes: Optional[bytes] = None
-        audio_fmt = "wav"
+        image_b64_list = [
+            base64.b64encode(img).decode("utf-8") for img in (item.images or [])
+        ]
 
-        rtype = getattr(item, "resource_type", "none")
-
-        if rtype == "image":
-            image_b64_list = [base64.b64encode(img).decode("utf-8") for img in (item.images or [])]
-
-        elif rtype == "video":
-            keyframes = _extract_keyframes(item.video_path, max_frames=3) if item.video_path else []
-            image_b64_list = keyframes
-
-        elif rtype == "audio":
-            audio_bytes = item.audio
-            if item.resource_paths:
-                for rp in item.resource_paths:
-                    ext = rp.rsplit(".", 1)[-1].lower() if "." in rp else "wav"
-                    if ext in ("wav", "mp3", "flac", "m4a", "ogg"):
-                        audio_fmt = ext
-                        break
-
-        # rtype "pdf" and "none": no media to send to LLM
+        # For Omni: extract video keyframes as images
+        if item.video_path and not image_b64_list:
+            keyframes = _extract_keyframes(item.video_path, max_frames=3)
+            image_b64_list.extend(keyframes)
 
         # Build tools for this item's dataset type
         tools = build_tools(
@@ -473,26 +483,35 @@ class HyperSkillGRPOTrainer:
         search_count = 0
         seen_queries: set = set()
 
+        # Optional override: tighter constraints for AIME-style direct-answer mode
+        rollout_system = getattr(self, "_rollout_system", None) or "You are a helpful assistant."
+        rollout_prefix = getattr(self, "_rollout_prefix", "")
+
         for round_idx in range(max_rounds):
+            # If a prefix is configured (e.g. "<answer>"), prime the model
+            effective_prompt = prompt + rollout_prefix if round_idx == 0 else prompt
+
             # Generate next response
-            if image_b64_list or audio_bytes:
-                response = await async_llm_call_with_media(
-                    prompt=prompt,
+            if image_b64_list:
+                response = await async_llm_call_with_images(
+                    prompt=effective_prompt,
                     image_b64_list=image_b64_list,
                     cfg=self._llm_cfg,
-                    audio_bytes=audio_bytes,
-                    audio_fmt=audio_fmt,
                     max_tokens=self.cfg.rollout.max_new_tokens,
+                    system=rollout_system,
                 )
-                # Only send audio on the first round (context is in the conversation history)
-                audio_bytes = None
             else:
                 response = await async_llm_call(
-                    prompt=prompt,
+                    prompt=effective_prompt,
                     cfg=self._llm_cfg,
                     use_cache=False,
                     max_tokens=self.cfg.rollout.max_new_tokens,
+                    system=rollout_system,
                 )
+
+            # Re-prepend prefix to response so downstream parsing sees the full token sequence
+            if rollout_prefix and round_idx == 0 and not response.startswith(rollout_prefix):
+                response = rollout_prefix + response
 
             response_list.append(response)
             prompt += response
@@ -575,31 +594,50 @@ class HyperSkillGRPOTrainer:
     # ------------------------------------------------------------------
 
     async def evaluate(self, dataloader) -> Dict[str, float]:
-        """Run evaluation without skill library updates."""
+        """Run evaluation without skill library updates.
+        Uses test_top_k and test_min_similarity for retrieval quality gating.
+        """
         all_f1: List[float] = []
         all_format: List[float] = []
 
-        for batch in tqdm(dataloader, desc="Evaluating"):
-            queries = [item.question for item in batch]
-            skills_per_query = await self.skill_library.retrieve_for_batch(
-                queries=queries, top_k=self.cfg.hypergraph.top_k
-            )
+        # Use test-time retrieval parameters (stricter than training)
+        hcfg = self.cfg.hypergraph
+        eval_top_k = getattr(hcfg, "test_top_k", hcfg.top_k)
+        eval_min_sim = getattr(hcfg, "test_min_similarity", 0.0)
 
-            for item, skills in zip(batch, skills_per_query):
+        eval_sem = asyncio.Semaphore(16)
+
+        async def _eval_one(item, skills):
+            async with eval_sem:
+                # Skip summarize_skills (extra LLM call) — just format raw skills
                 prompt = build_skill_augmented_prompt(
                     question=item.question,
                     modality=self.cfg.data.modality,
                     task_type=item.task_type,
                     skills=skills,
+                    skill_summary=None,
                 )
-                rollout = await self._single_rollout(item, prompt)
-                f1 = compute_combined_reward(
+                try:
+                    rollout = await self._single_rollout(item, prompt)
+                except Exception:
+                    return 0.0
+                return compute_combined_reward(
                     prediction=rollout["full_response"],
                     gold_answers=item.gold_answers,
                     response_list=rollout["response_list"],
                     task_type=item.task_type,
                 )
-                all_f1.append(f1)
+
+        for batch in tqdm(dataloader, desc="Evaluating"):
+            queries = [item.question for item in batch]
+            skills_per_query = await self.skill_library.retrieve_for_batch(
+                queries=queries, top_k=eval_top_k,
+                min_similarity=eval_min_sim,
+            )
+            scores = await asyncio.gather(*[
+                _eval_one(item, sk) for item, sk in zip(batch, skills_per_query)
+            ])
+            all_f1.extend(scores)
 
         return {
             "f1": float(np.mean(all_f1)) if all_f1 else 0.0,

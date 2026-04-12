@@ -248,8 +248,17 @@ def sync_embed_texts(texts: List[str], cfg: LLMConfig) -> np.ndarray:
     def _embed_batch(batch: List[str]) -> List[List[float]]:
         # Replace empty strings to avoid API errors
         batch = [t if t.strip() else " " for t in batch]
-        resp = client.embeddings.create(model=cfg.embedding_model, input=batch)
-        return [d.embedding for d in sorted(resp.data, key=lambda d: d.index)]
+        for attempt in range(3):
+            try:
+                resp = client.embeddings.create(model=cfg.embedding_model, input=batch)
+                if not resp.data:
+                    raise ValueError("No embedding data received")
+                return [d.embedding for d in sorted(resp.data, key=lambda d: d.index)]
+            except Exception as e:
+                if attempt < 2:
+                    import time; time.sleep(2 ** attempt)
+                    continue
+                raise
 
     batches = [texts[i: i + _EMBED_BATCH] for i in range(0, len(texts), _EMBED_BATCH)]
     results: list = [None] * len(batches)
@@ -320,66 +329,6 @@ async def async_llm_call_with_images(
     import functools
     fn = functools.partial(
         sync_llm_call_with_images, prompt, image_b64_list, cfg,
-        system=system, max_tokens=max_tokens,
-    )
-    return await _run_in_executor(fn)
-
-
-def sync_llm_call_with_media(
-    prompt: str,
-    image_b64_list: List[str],
-    cfg: LLMConfig,
-    audio_bytes: Optional[bytes] = None,
-    audio_fmt: str = "wav",
-    system: str = "You are a helpful assistant.",
-    max_tokens: Optional[int] = None,
-) -> str:
-    """
-    Chat completion with images and/or audio.
-    Audio is sent as an 'input_audio' content part (Gemini via apiyi).
-    """
-    client = _get_client(cfg)
-    content: list = []
-    for b64 in image_b64_list:
-        raw = base64.b64decode(b64[:16] + "==")
-        mime = "image/png" if raw[:4] == b"\x89PNG" else "image/jpeg"
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:{mime};base64,{b64}"},
-        })
-    if audio_bytes:
-        b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
-        content.append({
-            "type": "input_audio",
-            "input_audio": {"data": b64_audio, "format": audio_fmt},
-        })
-    content.append({"type": "text", "text": prompt})
-
-    resp = client.chat.completions.create(
-        model=cfg.model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user",   "content": content},
-        ],
-        max_tokens=max_tokens or cfg.max_tokens,
-        temperature=cfg.temperature,
-    )
-    return resp.choices[0].message.content or ""
-
-
-async def async_llm_call_with_media(
-    prompt: str,
-    image_b64_list: List[str],
-    cfg: LLMConfig,
-    audio_bytes: Optional[bytes] = None,
-    audio_fmt: str = "wav",
-    system: str = "You are a helpful assistant.",
-    max_tokens: Optional[int] = None,
-) -> str:
-    import functools
-    fn = functools.partial(
-        sync_llm_call_with_media, prompt, image_b64_list, cfg,
-        audio_bytes=audio_bytes, audio_fmt=audio_fmt,
         system=system, max_tokens=max_tokens,
     )
     return await _run_in_executor(fn)

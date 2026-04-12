@@ -7,16 +7,7 @@ System prompts for HyperSkill agents across all modalities and hop types.
 # ---------------------------------------------------------------------------
 
 REASONING_PROMPT = """\
-You are an expert reasoning assistant. Carefully analyze the question and use
-the provided skills and context to derive a precise answer.
-
-You must respond in the following format:
-<reason>
-Step-by-step reasoning goes here.
-</reason>
-<answer>
-Final concise answer goes here.
-</answer>
+Answer the following question. Output ONLY your final answer inside <answer>...</answer> tags. Do NOT show your work.
 """
 
 # ---------------------------------------------------------------------------
@@ -226,6 +217,22 @@ Now answer the following question.
 """
 
 # ---------------------------------------------------------------------------
+# Skill summary prompt — synthesize retrieved skills into a concise hint
+# ---------------------------------------------------------------------------
+
+SKILL_SUMMARY_PROMPT = """\
+Given a question and a set of retrieved reasoning skills, write a concise \
+strategy hint (2-3 sentences) that synthesizes these skills specifically for \
+this question. Focus on HOW to combine them, not just listing them.
+
+Question: {question}
+
+Retrieved Skills:
+{skills_raw}
+
+Strategy hint (2-3 sentences, actionable):"""
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -255,15 +262,44 @@ def build_initial_prompt(
     return base + f"\n\nHere is the question:\n{question}"
 
 
+async def summarize_skills(question: str, skills: list, llm_cfg) -> str:
+    """
+    Call LLM to synthesize retrieved skills into a concise, question-aware hint.
+    Falls back to raw format_skills_context if LLM call fails.
+    """
+    if not skills:
+        return "(No relevant skills found)"
+    from .llm import async_llm_call
+    skills_raw = format_skills_context(skills)
+    prompt = SKILL_SUMMARY_PROMPT.format(question=question, skills_raw=skills_raw)
+    try:
+        summary = await async_llm_call(
+            prompt=prompt,
+            cfg=llm_cfg,
+            system="You are a concise math reasoning coach.",
+            use_cache=True,
+            max_tokens=150,
+            temperature=0.2,
+        )
+        return summary.strip()
+    except Exception:
+        return skills_raw
+
+
 def build_skill_augmented_prompt(
     question: str,
     modality: str,
     task_type: str,
     skills: list,
     tool_desc: str = "",
+    skill_summary: str = None,
 ) -> str:
-    """Build a skill-augmented initial prompt."""
-    skill_ctx = format_skills_context(skills)
+    """Build a skill-augmented initial prompt.
+
+    If skill_summary is provided (pre-computed via summarize_skills),
+    it is used instead of the raw skill list.
+    """
+    skill_ctx = skill_summary if skill_summary is not None else format_skills_context(skills)
     base = build_initial_prompt(question, modality, task_type, tool_desc=tool_desc)
     skill_header = SKILL_AUGMENTED_PROMPT.format(skills_context=skill_ctx)
     return skill_header + "\n\n" + base

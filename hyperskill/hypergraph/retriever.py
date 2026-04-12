@@ -58,6 +58,7 @@ class HypergraphRetriever:
         image_bytes: Optional[bytes] = None,
         source_filter: Optional[str] = None,
         modality_filter: Optional[str] = None,
+        min_similarity: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """
         Retrieve the most relevant skills for a given query.
@@ -68,6 +69,7 @@ class HypergraphRetriever:
             image_bytes    : optional image for multimodal query
             source_filter  : restrict to a specific dataset source
             modality_filter: restrict to a specific modality
+            min_similarity : cosine similarity floor (discard hits below this)
 
         Returns:
             List of skill dicts (from kv_skills), ranked by relevance.
@@ -93,21 +95,22 @@ class HypergraphRetriever:
 
         # -- 3. Search hyperedge VDB then expand ---------------------------
         edge_hits = self.vdb_hyperedges.query(query_vec, top_k=top_k)
-        expanded_skill_ids = set()
-        for edge_id, _ in edge_hits:
+        min_sim = min_similarity if min_similarity is not None else 0.0
+        extra_hits: list = []
+        for edge_id, edge_sim in edge_hits:
+            if edge_sim < min_sim:          # 超边本身不相关，跳过
+                continue
             edge_data = self.kv_hyperedges.get(edge_id, {})
             for nid in edge_data.get("node_ids", []):
-                expanded_skill_ids.add(nid)
-        # Add expanded skills with lower rank
-        extra_hits = [
-            (nid, 0.5) for nid in expanded_skill_ids
-            if not any(nid == h[0] for h in skill_hits)
-        ]
+                if not any(nid == h[0] for h in skill_hits):
+                    extra_hits.append((nid, edge_sim * 0.8))
         all_hits = skill_hits + extra_hits
 
         # -- 4. Filter -------------------------------------------------------
         filtered = []
         for skill_id, sim in all_hits:
+            if sim < min_sim:
+                continue
             skill_data = self.kv_skills.get(skill_id)
             if skill_data is None:
                 continue
@@ -126,13 +129,15 @@ class HypergraphRetriever:
         queries: List[str],
         top_k: Optional[int] = None,
         image_bytes_list: Optional[List[Optional[bytes]]] = None,
+        min_similarity: Optional[float] = None,
     ) -> List[List[Dict[str, Any]]]:
         """Retrieve skills for a batch of queries."""
         import asyncio
         tasks = []
         for i, query in enumerate(queries):
             img = image_bytes_list[i] if image_bytes_list else None
-            tasks.append(self.retrieve(query, top_k=top_k, image_bytes=img))
+            tasks.append(self.retrieve(query, top_k=top_k, image_bytes=img,
+                                       min_similarity=min_similarity))
         return await asyncio.gather(*tasks)
 
     # ------------------------------------------------------------------

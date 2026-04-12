@@ -217,3 +217,7 @@ expr/
 outputs/
 data/
 dataset/
+README_*
+plots/
+baseline*
+PAPER*.md

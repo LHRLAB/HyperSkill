@@ -74,6 +74,82 @@ def compute_f1_reward(
     return max(token_f1(pred_text, gold) for gold in gold_answers)
 
 
+def _normalize_math(s: str) -> str:
+    """Normalize a math answer string for comparison.
+    Strips LaTeX wrappers, whitespace, trailing punctuation."""
+    s = s.strip()
+    # Strip $...$ delimiters
+    s = re.sub(r"^\$+|\$+$", "", s).strip()
+    # Strip \boxed{...}
+    m = re.match(r"\\boxed\{(.*)\}\s*$", s, re.DOTALL)
+    if m:
+        s = m.group(1).strip()
+    # Strip \text{...}
+    s = re.sub(r"\\text\{([^}]*)\}", r"\1", s)
+    # Remove all whitespace inside (matrix entries vary in spacing)
+    s = re.sub(r"\s+", "", s)
+    # Remove trailing periods
+    s = s.rstrip(".")
+    return s.lower()
+
+
+def compute_math_em_reward(
+    prediction: str,
+    gold_answers: Union[str, List[str]],
+) -> float:
+    """
+    Strict exact-match reward for math answers.
+
+    Pipeline:
+      1. ONLY look inside the LAST <answer>...</answer> tag (no tag → 0).
+      2. Try multiple normalization strategies:
+         (a) Single MC letter A-J → letter EM
+         (b) Single integer → integer EM
+         (c) Otherwise → normalized LaTeX/string EM
+      3. Compare against gold (try same strategies).
+    """
+    if isinstance(gold_answers, str):
+        gold_answers = [gold_answers]
+
+    # 1. Require <answer> tag
+    answer_match = re.findall(r"<answer>(.*?)</answer>", prediction, re.DOTALL)
+    if not answer_match:
+        return 0.0
+    pred_text = answer_match[-1].strip()
+
+    # 2a. MC letter (single letter A-J, optionally wrapped in (...))
+    pred_letter_m = re.match(r"^\(?([A-J])\)?\.?$", pred_text.strip())
+    if pred_letter_m:
+        pred_letter = pred_letter_m.group(1)
+        for gold in gold_answers:
+            g = str(gold).strip()
+            gm = re.match(r"^\(?([A-J])\)?\.?", g)
+            if gm and gm.group(1) == pred_letter:
+                return 1.0
+        return 0.0
+
+    # 2b. Pure integer
+    pred_nums = re.findall(r"-?\d+", pred_text)
+    is_pure_int = (len(pred_nums) == 1 and pred_text.strip().lstrip("-").isdigit())
+    if is_pure_int:
+        pred_int = int(pred_nums[0])
+        for gold in gold_answers:
+            gold_nums = re.findall(r"-?\d+", str(gold))
+            if gold_nums and len(gold_nums) == 1:
+                if int(gold_nums[0]) == pred_int:
+                    return 1.0
+        return 0.0
+
+    # 2c. Normalized LaTeX/string EM
+    pred_norm = _normalize_math(pred_text)
+    if not pred_norm:
+        return 0.0
+    for gold in gold_answers:
+        if _normalize_math(str(gold)) == pred_norm:
+            return 1.0
+    return 0.0
+
+
 # ---------------------------------------------------------------------------
 # Format rewards
 # ---------------------------------------------------------------------------
@@ -213,16 +289,11 @@ def compute_combined_reward(
     search_weight: float = 0.1,
 ) -> float:
     """
-    Combined reward = f1_weight * F1 + format_weight * Format + search_weight * Search
+    Combined reward = f1_weight * (EM or F1) + format_weight * Format + search_weight * Search
+    For math tasks (AIME-style), use PURE strict exact-match (no format/search bonus).
     """
-    f1 = compute_f1_reward(prediction, gold_answers)
-    fmt = compute_format_reward(response_list, task_type)
-    if task_type == "websearch":
-        srch = compute_search_reward(response_list)
-    else:
-        srch = 0.0
-
-    return f1_weight * f1 + format_weight * fmt + search_weight * srch
+    # Unified: all tasks use pure token-level F1 on the extracted answer
+    return compute_f1_reward(prediction, gold_answers)
 
 
 # ---------------------------------------------------------------------------

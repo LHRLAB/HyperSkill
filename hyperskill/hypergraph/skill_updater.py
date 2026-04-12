@@ -166,6 +166,12 @@ class SkillUpdater:
                 all_skills.extend(r["skills"])
                 all_recipes.extend(r["recipes"])
 
+        # Debug: how many groups had variance, how many produced skills
+        n_groups = len(groups)
+        n_with_results = sum(1 for r in extraction_results if r)
+        print(f"  [SkillDistill] groups={n_groups}, with_variance_extracted={n_with_results}, "
+              f"raw_skills={len(all_skills)}")
+
         if not all_skills:
             return {"added": 0, "verified": 0, "recipes": 0}
 
@@ -192,7 +198,7 @@ class SkillUpdater:
         print(
             f"  [SkillDistill] {len(all_skills)} extracted → "
             f"{len(verified)} verified → {added} added, "
-            f"⬡{recipe_count} recipes"
+            f"[recipe]{recipe_count} recipes"
         )
         return {"added": added, "verified": len(verified), "recipes": recipe_count}
 
@@ -211,18 +217,31 @@ class SkillUpdater:
         semaphore = asyncio.Semaphore(concurrency)
         results: List[Optional[Dict]] = [None] * len(groups)
 
+        skip_no_var = [0]
+        skip_no_split = [0]
+        empty_extract = [0]
+
         async def _process(idx: int, group: Dict[str, Any]):
             async with semaphore:
                 trajs = group["trajectories"]
                 rewards = [t["reward"] for t in trajs]
                 # Need variance to compare
-                if max(rewards) - min(rewards) < 0.1:
+                if max(rewards) - min(rewards) < 0.15:  # need some signal
+                    skip_no_var[0] += 1
                     return
 
-                median_r = sorted(rewards)[len(rewards) // 2]
-                good = [t for t in trajs if t["reward"] > median_r]
-                bad = [t for t in trajs if t["reward"] <= median_r]
+                # Split by mean for even sizes, median for odd
+                # (using strict > / <= avoids the n=2 edge case where max == median)
+                pivot = sum(rewards) / len(rewards)
+                good = [t for t in trajs if t["reward"] > pivot]
+                bad = [t for t in trajs if t["reward"] < pivot]
                 if not good or not bad:
+                    # Fallback: split by max vs rest
+                    max_r = max(rewards)
+                    good = [t for t in trajs if t["reward"] >= max_r]
+                    bad = [t for t in trajs if t["reward"] < max_r]
+                if not good or not bad:
+                    skip_no_split[0] += 1
                     return
 
                 def _fmt(traj_list, label):
@@ -255,10 +274,15 @@ class SkillUpdater:
                     recipes = _parse_skill_recipes(response)
                     if skills:
                         results[idx] = {"skills": skills, "recipes": recipes}
+                    else:
+                        empty_extract[0] += 1
+                        logger.debug("No skills parsed from response: %s", response[:200])
                 except Exception as exc:
                     logger.warning("contrastive_extract failed: %s", exc)
 
         await asyncio.gather(*[_process(i, g) for i, g in enumerate(groups)])
+        print(f"  [Extract debug] no_variance={skip_no_var[0]}, "
+              f"no_split={skip_no_split[0]}, empty_extract={empty_extract[0]}")
         return results
 
     # ── Stage 2: Counterfactual verification ──────────────────────────────
@@ -268,7 +292,7 @@ class SkillUpdater:
         candidates: List[Dict[str, str]],
         groups: List[Dict[str, Any]],
         concurrency: int,
-        max_checks: int = 2,
+        max_checks: int = 1,  # was 2 — halve verify LLM calls
     ) -> List[Dict[str, str]]:
         """Test each candidate on failed trajectories: would it have helped?"""
         # Collect failures
@@ -340,7 +364,7 @@ class SkillUpdater:
             "description": description,
             "modality": "text",
             "hop_type": "single",
-            "advantage": 0.0,  # starts neutral, evolves via retrieval feedback
+            "advantage": 0.3,  # bootstrap positive: skill passed counterfactual verification
             "examples": [],
         }
         await self.builder._upsert_skills([skill_dict])
@@ -363,6 +387,7 @@ class SkillUpdater:
                 name_to_id[s["name"].lower()] = sid
 
         count = 0
+        vdb_batch = []  # (edge_id, desc) for batch embed at end
         for recipe in recipes:
             node_ids = []
             for skill_name in recipe.get("skills", []):
@@ -375,6 +400,9 @@ class SkillUpdater:
                 continue
 
             edge_id = make_edge_id(node_ids)
+            if self.builder.vdb_hyperedges.has(edge_id):
+                continue  # already in VDB, skip
+
             desc = (
                 f"{recipe['name']}: {recipe.get('condition', '')} "
                 f"[{' + '.join(recipe.get('skills', []))}]"
@@ -395,6 +423,19 @@ class SkillUpdater:
                 self.builder.graph.upsert_edge(
                     edge_id, nid, weight=0.1, relation="recipe_component",
                 )
+            vdb_batch.append((edge_id, desc))
             count += 1
+
+        # Embed all new recipe hyperedges in one batch and write to VDB
+        if vdb_batch:
+            from ..llm import sync_embed_texts
+            descs = [d for _, d in vdb_batch]
+            try:
+                vecs = sync_embed_texts(descs, self.llm_cfg)
+                self.builder.vdb_hyperedges.upsert_batch(
+                    [(eid, vecs[i]) for i, (eid, _) in enumerate(vdb_batch)]
+                )
+            except Exception as exc:
+                logger.warning("Recipe hyperedge VDB embed failed: %s", exc)
 
         return count

@@ -4,9 +4,14 @@ Configuration dataclasses for HyperSkill.
 
 from __future__ import annotations
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional, Dict, Any
 import yaml
 import os
+
+
+# Bundled per-modality YAMLs live next to this file (hyperskill/configs/)
+CONFIGS_DIR = Path(__file__).parent / "configs"
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +39,9 @@ class HypergraphConfig:
     chunk_size: int = 512
     chunk_overlap: int = 64
     top_k: int = 10
+    # Retrieval quality gating (applied at test/inference time)
+    test_top_k: int = 3              # max skills injected during inference
+    test_min_similarity: float = 0.2 # discard hits below this cosine similarity at inference
     # Skill deduplication: cosine similarity threshold for near-duplicate suppression.
     # Set to 1.0 to disable during training (avoids expensive merge LLM calls).
     skill_dedup_threshold: float = 1.0
@@ -49,7 +57,7 @@ class HypergraphConfig:
 @dataclass
 class RolloutConfig:
     """Rollout / generation settings."""
-    n: int = 2                       # rollout samples per question
+    n: int = 4                       # rollout samples per question
     max_gen_round: int = 3           # max agentic rounds per rollout
     max_prompt_length: int = 8096    # word budget
     max_new_tokens: int = 1024
