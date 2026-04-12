@@ -536,8 +536,15 @@ class HyperSkillGRPOTrainer:
                     seen_queries.add(query)
                     search_count += 1
 
-                    # Execute the tool
-                    search_result = await tool.search(query=query)
+                    # Execute the tool. For doc_search, restrict ranking to the
+                    # PDF this question is about — corpus may have hundreds of
+                    # unrelated docs that would otherwise dominate BM25.
+                    if tag == "doc_search" and item.resource_paths:
+                        search_result = await tool.search(
+                            query=query, restrict_to=item.resource_paths,
+                        )
+                    else:
+                        search_result = await tool.search(query=query)
 
                     # Re-retrieve skills with updated context (question + search result)
                     try:
@@ -609,13 +616,23 @@ class HyperSkillGRPOTrainer:
 
         eval_sem = asyncio.Semaphore(16)
 
+        from ..agents.tools import build_tools, format_available_tools
+
         async def _eval_one(item, skills):
             async with eval_sem:
+                tools = build_tools(
+                    task_type=item.task_type,
+                    dataset_name=item.source,
+                    corpus_dir=item.dataset_dir,
+                    llm_cfg=self._llm_cfg,
+                )
+                tool_desc = format_available_tools(tools)
                 prompt = build_skill_augmented_prompt(
                     question=item.question,
                     modality=self.cfg.data.modality,
                     task_type=item.task_type,
                     skills=skills,
+                    tool_desc=tool_desc,
                     skill_summary=None,
                 )
                 try:

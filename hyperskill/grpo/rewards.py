@@ -164,6 +164,36 @@ _TEXT_SEARCH_RE = re.compile(
 _IMAGE_SEARCH_RE = re.compile(
     r"^<reason>.*?</reason>.*?<search><img></search>$", re.DOTALL
 )
+_DOC_SEARCH_RE = re.compile(
+    r"^<reason>.*?</reason>.*?<doc_search>.*?</doc_search>$", re.DOTALL
+)
+_MEDIA_SEARCH_RE = re.compile(
+    r"^<reason>.*?</reason>.*?<media_search>.*?</media_search>$", re.DOTALL
+)
+
+
+def _is_valid_doc_search(response: str) -> bool:
+    if not _DOC_SEARCH_RE.match(response):
+        return False
+    if response.count("<reason>") != 1 or response.count("</reason>") != 1:
+        return False
+    if response.count("<doc_search>") != 1 or response.count("</doc_search>") != 1:
+        return False
+    if "<answer>" in response or "</answer>" in response:
+        return False
+    return True
+
+
+def _is_valid_media_search(response: str) -> bool:
+    if not _MEDIA_SEARCH_RE.match(response):
+        return False
+    if response.count("<reason>") != 1 or response.count("</reason>") != 1:
+        return False
+    if response.count("<media_search>") != 1 or response.count("</media_search>") != 1:
+        return False
+    if "<answer>" in response or "</answer>" in response:
+        return False
+    return True
 
 
 def _is_valid_direct_answer(response: str) -> bool:
@@ -245,7 +275,11 @@ def compute_format_reward(
                     return 0.5
                 return 0.0
         else:
-            if not (_is_valid_text_search(resp) or _is_valid_image_search(resp) or _is_valid_direct_answer(resp)):
+            if not (_is_valid_text_search(resp)
+                    or _is_valid_image_search(resp)
+                    or _is_valid_doc_search(resp)
+                    or _is_valid_media_search(resp)
+                    or _is_valid_direct_answer(resp)):
                 if "<reason>" in resp:
                     return 0.5
                 return 0.0

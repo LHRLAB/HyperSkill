@@ -221,3 +221,5 @@ README_*
 plots/
 baseline*
 PAPER*.md
+.claude/
+cache/

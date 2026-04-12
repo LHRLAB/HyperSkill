@@ -23,15 +23,6 @@ sudo apt-get install ffmpeg   # for audio/video processing
 echo "sk-your-apiyi-key" > api_key_apiyi.txt
 ```
 
-**SerpAPI** — required for web search tasks (`FVQA`, `InfoSeek`, `SimpleVQA`, `LiveVQA`).
-Get a key at [serpapi.com](https://serpapi.com):
-
-```bash
-echo "your-serpapi-key" > api_key_serpapi.txt
-```
-
-Without a SerpAPI key, web search falls back to skill library retrieval.
-
 ---
 
 ## Evaluation

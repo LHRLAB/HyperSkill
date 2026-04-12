@@ -39,11 +39,50 @@ class SearchTool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# SerpAPI on-disk cache
+#
+# All SerpAPI calls are cached to disk under cache/serpapi/{text,image}/<sha>.txt
+# so repeated training/eval runs hit the cache instead of burning API quota.
+# Set HYPERSKILL_DISABLE_SERPAPI_CACHE=1 to bypass.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_CACHE_ROOT = Path(__file__).resolve().parent.parent.parent / "cache" / "serpapi"
+
+
+def _cache_path(kind: str, key: str) -> Path:
+    h = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    d = _CACHE_ROOT / kind
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{h}.txt"
+
+
+def _cache_get(kind: str, key: str) -> Optional[str]:
+    if os.environ.get("HYPERSKILL_DISABLE_SERPAPI_CACHE"):
+        return None
+    p = _cache_path(kind, key)
+    if p.exists():
+        try:
+            return p.read_text(encoding="utf-8")
+        except OSError:
+            return None
+    return None
+
+
+def _cache_put(kind: str, key: str, value: str) -> None:
+    if os.environ.get("HYPERSKILL_DISABLE_SERPAPI_CACHE"):
+        return
+    try:
+        _cache_path(kind, key).write_text(value, encoding="utf-8")
+    except OSError as exc:
+        logger.warning("serpapi cache write failed: %s", exc)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # SerpAPI text search
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TextSearchTool(SearchTool):
-    """Web text search via SerpAPI."""
+    """Web text search via SerpAPI (with disk cache)."""
     name = "text_search"
     tag = "text_search"
 
@@ -52,14 +91,21 @@ class TextSearchTool(SearchTool):
         self.api_key = api_key or _resolve_serpapi_key()
 
     async def search(self, query: str, **kwargs) -> str:
+        cache_key = query.strip().lower()
+        cached = _cache_get("text", cache_key)
+        if cached is not None:
+            return cached
+
         if not self.api_key:
             return f"(SerpAPI key not configured — no results for: {query})"
         from ..search import serpapi_search
         try:
-            return await serpapi_search(query, self.api_key, num_results=5)
+            result = await serpapi_search(query, self.api_key, num_results=5)
         except Exception as exc:
             logger.warning("text_search failed: %s", exc)
             return f"(Search error: {exc})"
+        _cache_put("text", cache_key, result)
+        return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -67,7 +113,7 @@ class TextSearchTool(SearchTool):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class ImageSearchTool(SearchTool):
-    """Image-based web search via SerpAPI (Google Lens)."""
+    """Image-based web search via SerpAPI (Google Lens, with disk cache)."""
     name = "image_search"
     tag = "image_search"
 
@@ -76,17 +122,24 @@ class ImageSearchTool(SearchTool):
         self.api_key = api_key or _resolve_serpapi_key()
 
     async def search(self, query: str, image_url: str = "", **kwargs) -> str:
+        cache_key = f"{query.strip().lower()}|{image_url.strip()}"
+        cached = _cache_get("image", cache_key)
+        if cached is not None:
+            return cached
+
         if not self.api_key:
             return "(SerpAPI key not configured)"
         from ..search import serpapi_image_search
         try:
-            return await serpapi_image_search(
+            result = await serpapi_image_search(
                 query=query, api_key=self.api_key,
                 image_url=image_url, num_results=5,
             )
         except Exception as exc:
             logger.warning("image_search failed: %s", exc)
             return f"(Image search error: {exc})"
+        _cache_put("image", cache_key, result)
+        return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -151,12 +204,29 @@ class DocSearchTool(SearchTool):
                 json.dump({"chunks": chunks, "ids": chunk_ids}, f, ensure_ascii=False)
             print(f"  [DocSearch] Indexed {len(chunks)} chunks")
 
-    async def search(self, query: str, top_k: int = 5, **kwargs) -> str:
+    async def search(self, query: str, top_k: int = 5,
+                     restrict_to: Optional[List[str]] = None, **kwargs) -> str:
+        """
+        Args:
+            restrict_to: list of PDF stems (e.g. ["STEPBACK"]) — when given,
+                BM25 only ranks chunks whose chunk_id starts with `doc_<stem>_`.
+                Used by per-question doc QA so search doesn't drift to
+                unrelated PDFs in the same corpus.
+        """
         self._ensure_index()
         if not self._chunks:
             return "(No document corpus available)"
 
-        results = _bm25_search(query, self._chunks, self._chunk_ids, top_k)
+        chunks, chunk_ids = self._chunks, self._chunk_ids
+        if restrict_to:
+            stems = {Path(p).stem for p in restrict_to}
+            keep = [i for i, cid in enumerate(chunk_ids)
+                    if any(cid.startswith(f"doc_{stem}_") for stem in stems)]
+            if keep:
+                chunks    = [self._chunks[i]    for i in keep]
+                chunk_ids = [self._chunk_ids[i] for i in keep]
+
+        results = _bm25_search(query, chunks, chunk_ids, top_k)
         if not results:
             return "(No matching documents found)"
 

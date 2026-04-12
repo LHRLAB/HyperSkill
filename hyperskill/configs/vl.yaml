@@ -8,7 +8,7 @@ llm:
   embedding_model: gemini-embedding-2-preview
   embedding_dim: 3072
   max_tokens: 2048
-  temperature: 0.7
+  temperature: 1.0       # bumped from 0.7 — diversify rollouts so GRPO has variance
   max_retries: 3
   timeout: 90.0
 
@@ -22,7 +22,7 @@ hypergraph:
   prune_min_advantage: -0.5
 
 rollout:
-  n: 2
+  n: 4                   # bumped from 2 — more rollouts → more variance for skill extraction
   max_gen_round: 5
   max_prompt_length: 6144
   max_new_tokens: 1024
