@@ -53,7 +53,7 @@ DATASET_KEYS: Dict[str, Dict[str, str]] = {
     "MMLongBench-Doc": {"folder": "VL-Doc/MMLongBench-Doc", "modality": "vl",   "task_type": "docsearch",   "resource_type": "pdf"},
     # Omni ───────────────────────────────────────────────────────────────────
     "OmniVideoBench":  {"folder": "Omni/OmniVideoBench",    "modality": "omni", "task_type": "mmreasoning", "resource_type": "video"},
-    "WorldSense":      {"folder": "Omni/WorldSense",        "modality": "omni", "task_type": "mmreasoning", "resource_type": "video"},
+    "WorldSense":      {"folder": "Omni/WorldSense",        "modality": "omni", "task_type": "mmreasoning", "resource_type": "video_audio"},
 }
 
 
@@ -196,6 +196,26 @@ class HyperSkillDataset:
                     try:
                         raw = abs_p.read_bytes()
                         audio = raw[:10 * 1024 * 1024]   # 10 MB cap
+                    except OSError:
+                        pass
+
+        elif resource_type == "video_audio":
+            # Omni-modal (WorldSense): load BOTH video keyframes AND audio.
+            # Audio often carries the dialogue/effects the question is about.
+            vid_rel = row.get("video")
+            if vid_rel:
+                abs_p = self._folder / vid_rel
+                resource_paths.append(vid_rel)
+                if abs_p.exists() and abs_p.suffix.lower() in self.VIDEO_EXTS:
+                    video_path = str(abs_p)
+            aud_rel = row.get("audio")
+            if aud_rel:
+                abs_p = self._folder / aud_rel
+                resource_paths.append(aud_rel)
+                if abs_p.exists() and abs_p.suffix.lower() in self.AUDIO_EXTS:
+                    try:
+                        raw = abs_p.read_bytes()
+                        audio = raw[:10 * 1024 * 1024]
                     except OSError:
                         pass
         # resource_type == "none": text-only

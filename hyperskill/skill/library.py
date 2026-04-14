@@ -121,13 +121,20 @@ class SkillLibrary:
         top_k: Optional[int] = None,
         image_bytes_list: Optional[List[Optional[bytes]]] = None,
         min_similarity: Optional[float] = None,
+        min_advantage: float = 0.0,
     ) -> List[List[SkillNode]]:
-        """Retrieve skills for a batch of queries."""
+        """Retrieve skills for a batch of queries.
+
+        Applies an advantage floor: skills with negative learned advantage
+        (consistently hurt rollouts) are filtered out.
+        """
         raw_batch = await self.retriever.retrieve_for_batch(
             queries=queries,
             top_k=top_k,
             image_bytes_list=image_bytes_list,
             min_similarity=min_similarity,
+            min_advantage=min_advantage,    # push the floor into the retriever so
+                                            # RRF never wastes top-k on sub-threshold skills
         )
         return [[SkillNode.from_dict(r) for r in results] for results in raw_batch]
 

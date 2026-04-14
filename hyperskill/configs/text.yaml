@@ -14,8 +14,9 @@ llm:
 
 hypergraph:
   top_k: 1                     # only the single most relevant skill
-  test_top_k: 1
-  test_min_similarity: 0.5     # mid: fire only on reasonably-relevant skills
+  test_top_k: 2                # inject top 2 high-advantage skills for text/math
+  test_min_similarity: 0.6     # strict: only fire on highly relevant skills
+  test_min_advantage: 0.0      # text/math: skills are reliable, keep all positive-advantage
   skill_dedup_threshold: 1.0
   eta: 0.15
   beta: 0.01

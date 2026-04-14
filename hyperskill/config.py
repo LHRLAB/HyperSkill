@@ -42,6 +42,7 @@ class HypergraphConfig:
     # Retrieval quality gating (applied at test/inference time)
     test_top_k: int = 3              # max skills injected during inference
     test_min_similarity: float = 0.2 # discard hits below this cosine similarity at inference
+    test_min_advantage:  float = 0.0 # require learned advantage ≥ this to inject the skill
     # Skill deduplication: cosine similarity threshold for near-duplicate suppression.
     # Set to 1.0 to disable during training (avoids expensive merge LLM calls).
     skill_dedup_threshold: float = 1.0
@@ -67,6 +68,22 @@ class RolloutConfig:
 
 
 @dataclass
+class EarlyStopConfig:
+    """Early-stopping criteria for the training loop.
+
+    Stops as soon as ANY of the patience-based criteria fires (after
+    `min_batches`). Set `enabled=False` (or all patiences to 0) to disable.
+    """
+    enabled: bool = True
+    min_batches: int = 16            # never stop before this many batches
+    f1_window: int = 8               # rolling window for F1 plateau check
+    f1_min_delta: float = 0.005      # required F1 improvement over the window
+    f1_patience: int = 16            # consecutive non-improving windows before stopping
+    skill_patience: int = 24         # batches without any new skill insertion before stopping
+    novariance_patience: int = 16    # consecutive all-no-variance batches before stopping
+
+
+@dataclass
 class DataConfig:
     """Dataset and modality settings."""
     modality: str = "text"           # "text" | "vl" | "omni"
@@ -86,6 +103,7 @@ class HyperSkillConfig:
     hypergraph: HypergraphConfig = field(default_factory=HypergraphConfig)
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    early_stop: EarlyStopConfig = field(default_factory=EarlyStopConfig)
 
     policy_model: str = "gemini-3.1-flash-lite-preview"
     mode: str = "train"              # "train" | "test"
@@ -138,6 +156,7 @@ def load_config(yaml_path: str, base: Optional["HyperSkillConfig"] = None) -> "H
         ("hypergraph", HypergraphConfig, "hypergraph"),
         ("rollout",    RolloutConfig,    "rollout"),
         ("data",       DataConfig,       "data"),
+        ("early_stop", EarlyStopConfig,  "early_stop"),
     ):
         if section in raw:
             sub = getattr(cfg, attr)

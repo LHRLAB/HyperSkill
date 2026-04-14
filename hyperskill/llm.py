@@ -77,23 +77,56 @@ def _get_client(cfg: LLMConfig) -> OpenAI:
 
 
 # ---------------------------------------------------------------------------
-# Simple response-level LRU cache
+# Response-level cache backed by both in-memory LRU and on-disk JSON files
 # ---------------------------------------------------------------------------
+# Disk cache is essential for reproducibility: two eval runs with the same
+# prompts must return byte-identical responses. Gemini at temperature=0 still
+# exhibits ~1-3% variation across calls without this layer. Disabled by
+# HYPERSKILL_DISABLE_LLM_CACHE=1.
 
+from pathlib import Path as _Path
+_LLM_CACHE_DIR = _Path(__file__).resolve().parent.parent / "cache" / "llm"
 _llm_cache: dict = {}
-_MAX_CACHE = 4096
+_MAX_CACHE = 16384
+
 
 def _cache_key(prompt: str, model: str) -> str:
-    return hashlib.md5(f"{model}::{prompt}".encode()).hexdigest()
+    return hashlib.sha256(f"{model}::{prompt}".encode()).hexdigest()
+
+
+def _disk_path(ck: str) -> _Path:
+    sub = _LLM_CACHE_DIR / ck[:2]
+    sub.mkdir(parents=True, exist_ok=True)
+    return sub / f"{ck}.txt"
+
 
 def _cache_get(ck: str) -> Optional[str]:
-    return _llm_cache.get(ck)
+    if os.environ.get("HYPERSKILL_DISABLE_LLM_CACHE"):
+        return None
+    if ck in _llm_cache:
+        return _llm_cache[ck]
+    p = _disk_path(ck)
+    if p.exists():
+        try:
+            val = p.read_text(encoding="utf-8")
+            _llm_cache[ck] = val
+            return val
+        except OSError:
+            return None
+    return None
+
 
 def _cache_set(ck: str, val: str) -> None:
+    if os.environ.get("HYPERSKILL_DISABLE_LLM_CACHE"):
+        return
     if len(_llm_cache) >= _MAX_CACHE:
         for k in list(_llm_cache.keys())[:_MAX_CACHE // 4]:
             del _llm_cache[k]
     _llm_cache[ck] = val
+    try:
+        _disk_path(ck).write_text(val, encoding="utf-8")
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -141,11 +174,27 @@ def sync_llm_call_with_images(
     cfg: LLMConfig,
     system: str = "You are a helpful assistant.",
     max_tokens: Optional[int] = None,
+    audio_bytes: Optional[bytes] = None,
+    audio_fmt: str = "wav",
+    use_cache: bool = True,
 ) -> str:
     """
-    Chat completion with inline images (base64 JPEG/PNG).
-    Images are sent as data URLs via 'image_url' content parts.
+    Chat completion with inline images (base64 JPEG/PNG) and optional audio.
+    Sends all modalities in a single request — images via image_url content
+    parts, audio via input_audio. Essential for Omni-modal QA (WorldSense)
+    where both video frames AND audio are required to answer.
     """
+    # Cache key: hash of prompt + system + image hashes + audio hash.
+    # This makes vision/audio calls byte-reproducible across eval runs —
+    # critical for the Zero-shot vs HyperSkill paired comparison.
+    img_fp = "".join(hashlib.sha256(b.encode()).hexdigest()[:8] for b in image_b64_list)
+    aud_fp = hashlib.sha256(audio_bytes).hexdigest()[:16] if audio_bytes else ""
+    ck = _cache_key(f"{system}\n{prompt}\n[img:{img_fp}][aud:{aud_fp}]", cfg.model)
+    if use_cache:
+        hit = _cache_get(ck)
+        if hit is not None:
+            return hit
+
     client = _get_client(cfg)
     content: list = []
     for b64 in image_b64_list:
@@ -155,6 +204,12 @@ def sync_llm_call_with_images(
         content.append({
             "type": "image_url",
             "image_url": {"url": f"data:{mime};base64,{b64}"},
+        })
+    if audio_bytes:
+        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+        content.append({
+            "type": "input_audio",
+            "input_audio": {"data": audio_b64, "format": audio_fmt},
         })
     content.append({"type": "text", "text": prompt})
 
@@ -167,7 +222,10 @@ def sync_llm_call_with_images(
         max_tokens=max_tokens or cfg.max_tokens,
         temperature=cfg.temperature,
     )
-    return resp.choices[0].message.content or ""
+    text = resp.choices[0].message.content or ""
+    if use_cache:
+        _cache_set(ck, text)
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -325,11 +383,14 @@ async def async_llm_call_with_images(
     cfg: LLMConfig,
     system: str = "You are a helpful assistant.",
     max_tokens: Optional[int] = None,
+    audio_bytes: Optional[bytes] = None,
+    audio_fmt: str = "wav",
 ) -> str:
     import functools
     fn = functools.partial(
         sync_llm_call_with_images, prompt, image_b64_list, cfg,
         system=system, max_tokens=max_tokens,
+        audio_bytes=audio_bytes, audio_fmt=audio_fmt,
     )
     return await _run_in_executor(fn)
 

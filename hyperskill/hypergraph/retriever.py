@@ -59,6 +59,7 @@ class HypergraphRetriever:
         source_filter: Optional[str] = None,
         modality_filter: Optional[str] = None,
         min_similarity: Optional[float] = None,
+        min_advantage: float = -2.0,
     ) -> List[Dict[str, Any]]:
         """
         Retrieve the most relevant skills for a given query.
@@ -91,7 +92,15 @@ class HypergraphRetriever:
                 query_vec /= norm
 
         # -- 2. Search skill VDB -------------------------------------------
-        skill_hits = self.vdb_skills.query(query_vec, top_k=top_k * 2)
+        # Fetch a WIDE candidate pool by similarity; downstream advantage/sim
+        # filters + RRF re-ranking pick the best. A narrow pool can miss the
+        # truly useful high-advantage skills because training-question embeddings
+        # don't always sit in the top-k neighborhood of a new test question.
+        # Fetch up to 100 candidates so high-advantage skills (which may sit
+        # outside the top-k neighborhood by raw embedding similarity) still
+        # surface after advantage filtering + RRF re-ranking.
+        pool_k = max(top_k * 20, 100)
+        skill_hits = self.vdb_skills.query(query_vec, top_k=pool_k)
 
         # -- 3. Search hyperedge VDB then expand ---------------------------
         edge_hits = self.vdb_hyperedges.query(query_vec, top_k=top_k)
@@ -114,6 +123,11 @@ class HypergraphRetriever:
             skill_data = self.kv_skills.get(skill_id)
             if skill_data is None:
                 continue
+            # Apply advantage floor BEFORE ranking so RRF doesn't waste its
+            # top-1 slot on a negative-advantage skill that would later be
+            # dropped by the library-level post-filter.
+            if skill_data.get("advantage", 0.0) < min_advantage:
+                continue
             if source_filter and skill_data.get("source") != source_filter:
                 continue
             if modality_filter and skill_data.get("modality") != modality_filter:
@@ -130,6 +144,7 @@ class HypergraphRetriever:
         top_k: Optional[int] = None,
         image_bytes_list: Optional[List[Optional[bytes]]] = None,
         min_similarity: Optional[float] = None,
+        min_advantage: float = -2.0,
     ) -> List[List[Dict[str, Any]]]:
         """Retrieve skills for a batch of queries."""
         import asyncio
@@ -137,7 +152,8 @@ class HypergraphRetriever:
         for i, query in enumerate(queries):
             img = image_bytes_list[i] if image_bytes_list else None
             tasks.append(self.retrieve(query, top_k=top_k, image_bytes=img,
-                                       min_similarity=min_similarity))
+                                       min_similarity=min_similarity,
+                                       min_advantage=min_advantage))
         return await asyncio.gather(*tasks)
 
     # ------------------------------------------------------------------

@@ -14,6 +14,9 @@ llm:
 
 hypergraph:
   top_k: 10
+  test_top_k: 1                # VL answers are short entities; extra skills dilute
+  test_min_similarity: 0.2     # VL queries semantically diverse; let top candidates pass
+  test_min_advantage: 0.15     # VL: moderate floor — prompt is now terse, less disruptive
   skill_dedup_threshold: 1.0
   eta: 0.1
   beta: 0.01

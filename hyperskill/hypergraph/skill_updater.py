@@ -166,14 +166,15 @@ class SkillUpdater:
                 all_skills.extend(r["skills"])
                 all_recipes.extend(r["recipes"])
 
-        # Debug: how many groups had variance, how many produced skills
+        no_var = getattr(self, "_last_no_variance", 0)
         n_groups = len(groups)
         n_with_results = sum(1 for r in extraction_results if r)
         print(f"  [SkillDistill] groups={n_groups}, with_variance_extracted={n_with_results}, "
               f"raw_skills={len(all_skills)}")
 
         if not all_skills:
-            return {"added": 0, "verified": 0, "recipes": 0}
+            return {"added": 0, "verified": 0, "recipes": 0,
+                    "groups_no_variance": no_var, "n_groups": n_groups}
 
         # Stage 2: Counterfactual verification
         verified = await self._counterfactual_verify(
@@ -181,7 +182,8 @@ class SkillUpdater:
         )
 
         if not verified:
-            return {"added": 0, "verified": 0, "recipes": 0}
+            return {"added": 0, "verified": 0, "recipes": 0,
+                    "groups_no_variance": no_var, "n_groups": n_groups}
 
         # Insert verified skills directly (no LLM CRUD)
         added = 0
@@ -200,7 +202,8 @@ class SkillUpdater:
             f"{len(verified)} verified → {added} added, "
             f"[recipe]{recipe_count} recipes"
         )
-        return {"added": added, "verified": len(verified), "recipes": recipe_count}
+        return {"added": added, "verified": len(verified), "recipes": recipe_count,
+                "groups_no_variance": no_var, "n_groups": n_groups}
 
     # ── Stage 1: Contrastive step-level extraction ────────────────────────
 
@@ -283,6 +286,9 @@ class SkillUpdater:
         await asyncio.gather(*[_process(i, g) for i, g in enumerate(groups)])
         print(f"  [Extract debug] no_variance={skip_no_var[0]}, "
               f"no_split={skip_no_split[0]}, empty_extract={empty_extract[0]}")
+        # Stash debug counts on self for the caller (lists can't take attrs)
+        self._last_no_variance = skip_no_var[0]
+        self._last_no_split    = skip_no_split[0]
         return results
 
     # ── Stage 2: Counterfactual verification ──────────────────────────────

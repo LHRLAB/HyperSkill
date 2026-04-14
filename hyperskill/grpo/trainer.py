@@ -64,6 +64,32 @@ def _extract_keyframes(video_path: str, max_frames: int = 3) -> List[str]:
         return []
 
 
+def _extract_audio_from_video(video_path: str) -> Optional[bytes]:
+    """Extract the audio track of a video file as WAV bytes via ffmpeg.
+
+    Needed for WorldSense where the audio track carries the dialogue/effects
+    the question is about but is embedded inside .mp4 (no separate .wav).
+    Returns None if ffmpeg is unavailable or the file has no audio track.
+    """
+    import subprocess, tempfile, os
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            out_path = tmp.name
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", video_path,
+            "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", out_path,
+        ]
+        subprocess.run(cmd, check=True, timeout=30, capture_output=True)
+        with open(out_path, "rb") as f:
+            data = f.read()
+        os.unlink(out_path)
+        # Cap at 10 MB (Gemini input_audio limit ~varies; be conservative)
+        return data[:10 * 1024 * 1024] if data else None
+    except Exception:
+        return None
+
+
 class HyperSkillGRPOTrainer:
     """
     Training-Free GRPO Trainer with omni-modal weighted hypergraph skill library.
@@ -121,6 +147,15 @@ class HyperSkillGRPOTrainer:
         total_format = 0.0
         batch_count = 0
 
+        # ─── Early-stopping bookkeeping ───────────────────────────────────
+        es = self.cfg.early_stop
+        f1_history: List[float] = []
+        best_window_f1 = -1.0
+        no_improve_streak = 0
+        no_skill_streak = 0
+        no_variance_streak = 0
+        stop_reason: Optional[str] = None
+
         max_retries = 3
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Training")):
             t0 = time.time()
@@ -166,12 +201,57 @@ class HyperSkillGRPOTrainer:
                     **self.skill_library.stats(),
                 })
 
+            # ─── Early stopping ──────────────────────────────────────────
+            if es.enabled:
+                f1_history.append(metrics["avg_f1"])
+                if metrics.get("skills_inserted", 0) > 0:
+                    no_skill_streak = 0
+                else:
+                    no_skill_streak += 1
+                # "no variance" means every group in this batch had identical
+                # rewards across rollouts — no contrastive signal at all.
+                if metrics.get("groups_no_variance", 0) >= len(batch):
+                    no_variance_streak += 1
+                else:
+                    no_variance_streak = 0
+
+                if batch_count >= es.min_batches:
+                    # F1 plateau: take the last `f1_window` batches' mean
+                    if len(f1_history) >= es.f1_window:
+                        window_mean = sum(f1_history[-es.f1_window:]) / es.f1_window
+                        if window_mean > best_window_f1 + es.f1_min_delta:
+                            best_window_f1 = window_mean
+                            no_improve_streak = 0
+                        else:
+                            no_improve_streak += 1
+
+                    if es.f1_patience and no_improve_streak >= es.f1_patience:
+                        stop_reason = (
+                            f"F1 plateau ({es.f1_patience} batches without "
+                            f">+{es.f1_min_delta} window improvement)"
+                        )
+                    elif es.skill_patience and no_skill_streak >= es.skill_patience:
+                        stop_reason = (
+                            f"no skill insertions for {es.skill_patience} consecutive batches"
+                        )
+                    elif es.novariance_patience and no_variance_streak >= es.novariance_patience:
+                        stop_reason = (
+                            f"all rollouts produced identical rewards for "
+                            f"{es.novariance_patience} consecutive batches"
+                        )
+
+                if stop_reason is not None:
+                    print(f"[EarlyStop] batch {batch_idx+1}/{total_batches}: {stop_reason}")
+                    break
+
         # Save final library
         self.skill_library.save()
 
         return {
             "avg_f1": total_f1 / max(1, batch_count),
             "avg_format": total_format / max(1, batch_count),
+            "batches_run": batch_count,
+            "early_stop": stop_reason or "",
             **self.skill_library.stats(),
         }
 
@@ -280,17 +360,23 @@ class HyperSkillGRPOTrainer:
         # -- Step 4: CRUD-based skill evolution (TrainingFreeGRPO style) ----
         # F1 threshold gate: only extract skills when scoring is reliable
         batch_avg_f1 = float(np.mean(all_f1)) if all_f1 else 0.0
+        groups_no_var = 0
         if batch_avg_f1 >= 0.15:
             try:
                 counts = await self.skill_updater.update(
                     updater_groups, concurrency=4, num_skills=3,
                 )
                 total_inserted = counts.get("added", 0) + counts.get("updated", 0)
+                groups_no_var = counts.get("groups_no_variance", 0)
             except Exception as exc:
-                logger.warning("SkillUpdater failed: %s", exc)
+                import traceback
+                print(f"  [SkillUpdater FAIL] {type(exc).__name__}: {exc}")
+                traceback.print_exc()
                 total_inserted = 0
         else:
             total_inserted = 0
+            # Below F1 gate: treat as 'no contrastive signal' for early-stop purposes
+            groups_no_var = len(updater_groups)
 
         # -- Step 5: Retrieval feedback → advantage update + co-occurrence edges
         self._retrieval_advantage_feedback(
@@ -318,6 +404,7 @@ class HyperSkillGRPOTrainer:
             "avg_format": float(np.mean(all_format)) if all_format else 0.0,
             "avg_reward": float(np.mean(all_rewards)) if all_rewards else 0.0,
             "skills_inserted": total_inserted,
+            "groups_no_variance": groups_no_var,
         }
 
     # ------------------------------------------------------------------
@@ -423,7 +510,7 @@ class HyperSkillGRPOTrainer:
         Handles multi-turn search loops (websearch tasks).
         Failed rollouts return an empty-response placeholder.
         """
-        max_concurrent = min(len(items), 32)
+        max_concurrent = min(len(items), 40)
         semaphore = asyncio.Semaphore(max_concurrent)
 
         async def _generate_one(item: DataBatch, prompt: str) -> Dict[str, Any]:
@@ -447,6 +534,8 @@ class HyperSkillGRPOTrainer:
         self,
         item: DataBatch,
         initial_prompt: str,
+        use_skills: bool = True,
+        use_tools: bool = True,
     ) -> Dict[str, Any]:
         """
         Execute one agentic rollout with unified multi-turn tool dispatch.
@@ -465,18 +554,34 @@ class HyperSkillGRPOTrainer:
             base64.b64encode(img).decode("utf-8") for img in (item.images or [])
         ]
 
-        # For Omni: extract video keyframes as images
+        # For Omni: extract video keyframes as images. 8 frames give much
+        # better temporal coverage than 3 — most video QA needs more than
+        # first/middle/last to localise events.
         if item.video_path and not image_b64_list:
-            keyframes = _extract_keyframes(item.video_path, max_frames=3)
+            keyframes = _extract_keyframes(item.video_path, max_frames=8)
             image_b64_list.extend(keyframes)
 
-        # Build tools for this item's dataset type
+        # Audio path: if the dataset doesn't ship a separate audio file,
+        # pull the audio track out of the video via ffmpeg (WorldSense case).
+        audio_bytes_to_send = item.audio
+        audio_fmt = "wav"
+        if audio_bytes_to_send and item.resource_paths:
+            for rp in item.resource_paths:
+                ext = rp.rsplit(".", 1)[-1].lower() if "." in rp else ""
+                if ext in ("wav", "mp3", "flac", "m4a", "ogg"):
+                    audio_fmt = ext
+                    break
+        elif item.video_path and item.resource_type == "video_audio" and not audio_bytes_to_send:
+            audio_bytes_to_send = _extract_audio_from_video(item.video_path)
+            audio_fmt = "wav"
+
+        # Build tools for this item's dataset type (skipped for pure-LM baseline)
         tools = build_tools(
             task_type=item.task_type,
             dataset_name=item.source,
             corpus_dir=item.dataset_dir,
             llm_cfg=self._llm_cfg,
-        )
+        ) if use_tools else {}
 
         max_rounds = self.cfg.rollout.max_gen_round
         max_searches = self.cfg.rollout.text_search_limit  # total search cap
@@ -492,19 +597,26 @@ class HyperSkillGRPOTrainer:
             effective_prompt = prompt + rollout_prefix if round_idx == 0 else prompt
 
             # Generate next response
-            if image_b64_list:
+            if image_b64_list or audio_bytes_to_send:
                 response = await async_llm_call_with_images(
                     prompt=effective_prompt,
                     image_b64_list=image_b64_list,
                     cfg=self._llm_cfg,
                     max_tokens=self.cfg.rollout.max_new_tokens,
                     system=rollout_system,
+                    audio_bytes=audio_bytes_to_send,
+                    audio_fmt=audio_fmt,
                 )
+                # Audio is in conversation history now; don't re-send on
+                # subsequent search rounds.
+                audio_bytes_to_send = None
             else:
+                # Enable cache in eval (temp=0 deterministic → identical calls
+                # must return identical responses for reproducibility).
                 response = await async_llm_call(
                     prompt=effective_prompt,
                     cfg=self._llm_cfg,
-                    use_cache=False,
+                    use_cache=(self.cfg.mode == "test"),
                     max_tokens=self.cfg.rollout.max_new_tokens,
                     system=rollout_system,
                 )
@@ -546,15 +658,21 @@ class HyperSkillGRPOTrainer:
                     else:
                         search_result = await tool.search(query=query)
 
-                    # Re-retrieve skills with updated context (question + search result)
-                    try:
-                        updated_skills = await self.skill_library.retrieve(
-                            query=item.question + " " + query,
-                            top_k=self.cfg.hypergraph.top_k,
-                        )
-                        skill_ctx = format_skills_context(updated_skills)
-                    except Exception:
-                        skill_ctx = ""
+                    # Re-retrieve skills mid-rollout: only during TRAINING, never
+                    # at eval. In eval, the initial skill was already selected with
+                    # full context; re-injecting a different skill after each search
+                    # turn tends to disrupt the model's coherent reasoning arc.
+                    skill_ctx = ""
+                    if use_skills and self.cfg.mode != "test":
+                        try:
+                            updated_skills = await self.skill_library.retrieve(
+                                query=item.question + " " + query,
+                                top_k=self.cfg.hypergraph.top_k,
+                            )
+                            if updated_skills:
+                                skill_ctx = format_skills_context(updated_skills)
+                        except Exception:
+                            skill_ctx = ""
 
                     # Build continuation prompt with search results + refreshed skills
                     after = AFTER_SEARCH_PROMPT.format(
@@ -600,7 +718,8 @@ class HyperSkillGRPOTrainer:
     # Evaluation mode
     # ------------------------------------------------------------------
 
-    async def evaluate(self, dataloader, use_skills: bool = True) -> Dict[str, float]:
+    async def evaluate(self, dataloader, use_skills: bool = True,
+                       ablation: str = "") -> Dict[str, float]:
         """Run evaluation without skill library updates.
 
         Args:
@@ -613,13 +732,42 @@ class HyperSkillGRPOTrainer:
         hcfg = self.cfg.hypergraph
         eval_top_k = getattr(hcfg, "test_top_k", hcfg.top_k)
         eval_min_sim = getattr(hcfg, "test_min_similarity", 0.0)
+        eval_min_adv = getattr(hcfg, "test_min_advantage", 0.0)
 
-        eval_sem = asyncio.Semaphore(16)
+        # ── Ablations of the 3 method contributions (Sec. 5.1/5.2/5.3) ────
+        # A1 = w/o CF verify   → proxy: retrieve candidates uniformly (ignore
+        #                        advantage) so noisy skills that CF would have
+        #                        rejected still slip through at eval.
+        # A2 = w/o adv update  → proxy: zero out advantages at retrieval, so
+        #                        the RRF advantage boost carries no signal.
+        # A3 = w/o gating      → remove similarity/advantage/top-k gates.
+        if ablation == "A1":
+            eval_min_adv = -2.0
+        elif ablation == "A2":
+            # Snapshot + zero advantages so RRF's advantage boost is inert.
+            # Restore at end of evaluate(). This emulates "no retrieval-feedback
+            # advantage evolution" (Sec. 5.2).
+            a2_snapshot = {}
+            for nid, nd in self.skill_library.builder.graph.all_nodes():
+                adv = nd.get("advantage", 0.0)
+                if adv != 0.0:
+                    a2_snapshot[nid] = adv
+                    self.skill_library.builder.graph.upsert_node(nid, advantage=0.0)
+        elif ablation == "A3":
+            eval_top_k = 5
+            eval_min_sim = 0.0
+            eval_min_adv = -2.0
+
+        eval_sem = asyncio.Semaphore(40)
 
         from ..agents.tools import build_tools, format_available_tools
 
         async def _eval_one(item, skills):
             async with eval_sem:
+                # Apples-to-apples: BOTH Zero-shot and HyperSkill use the same
+                # tool stack (SerpAPI/BM25/video-frames/audio). The only
+                # difference is whether the evolving skill library is consulted.
+                # This isolates the contribution of the skill hypergraph itself.
                 tools = build_tools(
                     task_type=item.task_type,
                     dataset_name=item.source,
@@ -636,7 +784,9 @@ class HyperSkillGRPOTrainer:
                     skill_summary=None,
                 )
                 try:
-                    rollout = await self._single_rollout(item, prompt)
+                    rollout = await self._single_rollout(item, prompt,
+                                                         use_skills=use_skills,
+                                                         use_tools=True)
                 except Exception:
                     return 0.0
                 return compute_combined_reward(
@@ -652,6 +802,7 @@ class HyperSkillGRPOTrainer:
                 skills_per_query = await self.skill_library.retrieve_for_batch(
                     queries=queries, top_k=eval_top_k,
                     min_similarity=eval_min_sim,
+                    min_advantage=eval_min_adv,
                 )
             else:
                 skills_per_query = [[] for _ in batch]
@@ -661,8 +812,21 @@ class HyperSkillGRPOTrainer:
             ])
             all_f1.extend(scores)
 
+        # Restore advantages mutated by A2 ablation so we don't poison the library
+        if ablation == "A2":
+            for nid, adv in locals().get("a2_snapshot", {}).items():
+                self.skill_library.builder.graph.upsert_node(nid, advantage=adv)
+
+        # Bootstrap mean ± std over 7 resamples of 85% of the test set.
+        # Uses the fixed per-question F1 list so the bootstrap is deterministic
+        # given the same scores and seed; no extra LLM calls.
+        bootstrap = _bootstrap_mean_std(all_f1, frac=0.85, n_runs=7, seed=42)
+
         return {
             "f1": float(np.mean(all_f1)) if all_f1 else 0.0,
+            "f1_per_question": all_f1,           # for offline re-bootstrap if needed
+            "bootstrap_mean": bootstrap["mean"],
+            "bootstrap_std":  bootstrap["std"],
             "n_samples": len(all_f1),
             "use_skills": use_skills,
             **self.skill_library.stats(),
@@ -672,6 +836,30 @@ class HyperSkillGRPOTrainer:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _bootstrap_mean_std(scores: List[float], frac: float = 0.85,
+                        n_runs: int = 7, seed: int = 42) -> Dict[str, float]:
+    """7× bootstrap over 85% of the per-question scores → mean ± std.
+
+    Matches the protocol described in PAPER.md: "随机取85%取七次".
+    """
+    if not scores:
+        return {"mean": 0.0, "std": 0.0, "subsample_means": []}
+    rng = np.random.default_rng(seed)
+    n_total = len(scores)
+    k = max(1, int(round(n_total * frac)))
+    arr = np.asarray(scores, dtype=float)
+    subsample_means = []
+    for _ in range(n_runs):
+        idx = rng.choice(n_total, size=k, replace=False)
+        subsample_means.append(float(arr[idx].mean()))
+    return {
+        "mean": float(np.mean(subsample_means)),
+        "std":  float(np.std(subsample_means)),
+        "subsample_means": subsample_means,
+    }
+
 
 def _cfg_to_dict(cfg) -> Dict[str, Any]:
     """Recursively convert a config dataclass to a dict."""

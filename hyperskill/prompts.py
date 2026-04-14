@@ -205,15 +205,7 @@ Would this skill have helped? Output VERDICT line only.
 # ---------------------------------------------------------------------------
 
 SKILL_AUGMENTED_PROMPT = """\
-You have access to a Skill Library — a collection of reasoning patterns and
-knowledge distilled from prior experience. Use the relevant skills below to
-guide your reasoning.
-
---- Relevant Skills ---
-{skills_context}
---- End of Skills ---
-
-Now answer the following question.
+Tip from prior experience: {skills_context}
 """
 
 # ---------------------------------------------------------------------------
@@ -237,16 +229,18 @@ Strategy hint (2-3 sentences, actionable):"""
 # ---------------------------------------------------------------------------
 
 def format_skills_context(skills: list) -> str:
-    """Format a list of SkillNode objects into a readable context string."""
+    """Format skills as a single terse hint line per skill.
+
+    Less intrusive than a full "Skill Library" preamble: just `name: description`.
+    Keeps the model focused on the question rather than on structural scaffolding.
+    """
     if not skills:
         return "(No relevant skills found)"
     lines = []
-    for i, skill in enumerate(skills, 1):
-        lines.append(f"[Skill {i}] {skill.name}")
-        lines.append(f"  Description: {skill.description}")
-        if skill.examples:
-            lines.append(f"  Examples: {'; '.join(skill.examples[:2])}")
-    return "\n".join(lines)
+    for skill in skills:
+        # Compact one-line form; description already short
+        lines.append(f"{skill.name}: {skill.description}")
+    return " | ".join(lines)
 
 
 def build_initial_prompt(
@@ -296,10 +290,16 @@ def build_skill_augmented_prompt(
 ) -> str:
     """Build a skill-augmented initial prompt.
 
-    If skill_summary is provided (pre-computed via summarize_skills),
-    it is used instead of the raw skill list.
+    When NO skill passes the retrieval gates, fall back to the plain
+    zero-shot prompt so HyperSkill ≥ Zero-shot on datasets where the skill
+    library doesn't (yet) help — no "(No relevant skills found)" banner is
+    injected, since it adds irrelevant tokens that can perturb the model.
     """
-    skill_ctx = skill_summary if skill_summary is not None else format_skills_context(skills)
+    has_skills = bool(skills) or (skill_summary is not None and skill_summary.strip()
+                                  and skill_summary.strip() != "(No relevant skills found)")
     base = build_initial_prompt(question, modality, task_type, tool_desc=tool_desc)
+    if not has_skills:
+        return base
+    skill_ctx = skill_summary if skill_summary is not None else format_skills_context(skills)
     skill_header = SKILL_AUGMENTED_PROMPT.format(skills_context=skill_ctx)
     return skill_header + "\n\n" + base
