@@ -159,6 +159,7 @@ async def evaluate_one(
     batch_size: int = 4,
     use_skills: bool = True,
     ablation: str = "",
+    baseline: str = "",
 ) -> dict:
     cfg = _build_cfg(ds_name, mode="test")
 
@@ -193,14 +194,18 @@ async def evaluate_one(
     print(f"[{ds_name}] {len(dataset)} samples", flush=True)
 
     trainer = HyperSkillGRPOTrainer(cfg)
-    metrics = await trainer.evaluate(loader, use_skills=use_skills, ablation=ablation)
+    metrics = await trainer.evaluate(loader, use_skills=use_skills,
+                                     ablation=ablation, baseline=baseline)
     metrics["dataset"]  = ds_name
     metrics["modality"] = cfg.data.modality
     metrics["ablation"] = ablation
+    metrics["baseline"] = baseline
 
     out_dir = PROJECT_ROOT / cfg.output_dir / cfg.exp_name
     out_dir.mkdir(parents=True, exist_ok=True)
-    if ablation:
+    if baseline:
+        out_file = f"eval_baseline_{baseline}.json"
+    elif ablation:
         out_file = f"eval_ablation_{ablation}.json"
     else:
         out_file = "eval_results.json" if use_skills else "eval_zeroshot.json"
@@ -232,6 +237,9 @@ def _main():
     p.add_argument("--batch-size",  type=int, default=4)
     p.add_argument("--split",       default="test")
     p.add_argument("--ablation",    default="", choices=["", "A1", "A2", "A3"])
+    p.add_argument("--baseline",    default="",
+                   choices=["", "trainingfreegrpo", "skillcraft", "autoskill",
+                            "evoskill", "mementoskills", "xskill"])
     args = p.parse_args()
 
     if args.train:
@@ -242,7 +250,8 @@ def _main():
                                  max_samples=args.max_samples,
                                  batch_size=args.batch_size,
                                  use_skills=args.eval,
-                                 ablation=args.ablation))
+                                 ablation=args.ablation,
+                                 baseline=args.baseline))
 
 
 if __name__ == "__main__":

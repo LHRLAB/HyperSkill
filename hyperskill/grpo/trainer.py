@@ -719,7 +719,8 @@ class HyperSkillGRPOTrainer:
     # ------------------------------------------------------------------
 
     async def evaluate(self, dataloader, use_skills: bool = True,
-                       ablation: str = "") -> Dict[str, float]:
+                       ablation: str = "",
+                       baseline: str = "") -> Dict[str, float]:
         """Run evaluation without skill library updates.
 
         Args:
@@ -758,6 +759,47 @@ class HyperSkillGRPOTrainer:
             eval_min_sim = 0.0
             eval_min_adv = -2.0
 
+        # ── Baseline methods (eval-time only, shared trained libraries) ────
+        skill_style = "hyperskill"
+        if baseline == "trainingfreegrpo":
+            skill_style = "trainingfreegrpo"
+            eval_top_k = 1
+            eval_min_sim = 0.0
+            eval_min_adv = -2.0
+        elif baseline == "skillcraft":
+            skill_style = "skillcraft"
+            eval_top_k = 3
+            eval_min_sim = 0.0
+            eval_min_adv = -2.0
+        elif baseline == "autoskill":
+            skill_style = "autoskill"
+            eval_top_k = 3
+            eval_min_sim = 0.0
+            eval_min_adv = -2.0
+        elif baseline == "evoskill":
+            skill_style = "evoskill"
+            # Frontier filter: dynamic median advantage threshold
+            from ..skill.library import SkillLibrary  # noqa
+            try:
+                advs = [n[1].get("advantage", 0.0)
+                        for n in self.skill_library.builder.graph.all_nodes(node_type="skill")]
+                med = float(np.median(advs)) if advs else 0.0
+            except Exception:
+                med = 0.0
+            eval_top_k = 3
+            eval_min_sim = 0.0
+            eval_min_adv = med  # only above-median skills
+        elif baseline == "mementoskills":
+            skill_style = "mementoskills"
+            eval_top_k = 1
+            eval_min_sim = 0.0
+            eval_min_adv = -2.0
+        elif baseline == "xskill":
+            skill_style = "xskill"
+            eval_top_k = 3
+            eval_min_sim = 0.0
+            eval_min_adv = -2.0
+
         eval_sem = asyncio.Semaphore(40)
 
         from ..agents.tools import build_tools, format_available_tools
@@ -782,6 +824,7 @@ class HyperSkillGRPOTrainer:
                     skills=skills,
                     tool_desc=tool_desc,
                     skill_summary=None,
+                    skill_style=skill_style,
                 )
                 try:
                     rollout = await self._single_rollout(item, prompt,

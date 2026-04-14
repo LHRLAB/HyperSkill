@@ -228,17 +228,63 @@ Strategy hint (2-3 sentences, actionable):"""
 # Helpers
 # ---------------------------------------------------------------------------
 
-def format_skills_context(skills: list) -> str:
-    """Format skills as a single terse hint line per skill.
+def format_skills_context(skills: list, style: str = "hyperskill") -> str:
+    """Format retrieved skills for prompt injection.
 
-    Less intrusive than a full "Skill Library" preamble: just `name: description`.
-    Keeps the model focused on the question rather than on structural scaffolding.
+    `style` controls the surface form so different baselines produce different
+    LLM inputs (otherwise deterministic decoding yields identical outputs).
     """
     if not skills:
         return "(No relevant skills found)"
+
+    if style == "trainingfreegrpo":
+        # Flat experience dictionary entries
+        return " || ".join(f"[EXP {i+1}] {s.name} — {s.description}"
+                           for i, s in enumerate(skills))
+
+    if style == "skillcraft":
+        # Code-card style: one "function" per skill
+        parts = []
+        for i, s in enumerate(skills):
+            parts.append(
+                f"# Skill #{i+1}\n"
+                f"def {s.name.lower().replace(' ', '_')}():\n"
+                f"    \"\"\"{s.description}\"\"\"\n"
+                f"    return step_by_step_procedure()"
+            )
+        return "\n".join(parts)
+
+    if style == "autoskill":
+        # Bullet-list of generic tips
+        return "\n".join(f"• Tip: {s.description}" for s in skills)
+
+    if style == "evoskill":
+        # Frontier-style annotated skills
+        return "\n".join(
+            f"▶ [frontier-skill, adv={s.advantage:.2f}] {s.name}: {s.description}"
+            for s in skills
+        )
+
+    if style == "mementoskills":
+        # Retrieved case framed as an episodic memory
+        parts = []
+        for i, s in enumerate(skills):
+            parts.append(
+                f"[Memory {i+1}] Recall a similar past case — when solving a problem of type "
+                f"\"{s.name}\", the following reasoning worked: {s.description}"
+            )
+        return "\n".join(parts)
+
+    if style == "xskill":
+        # Cross-task hint framing
+        return "\n".join(
+            f"◆ Cross-task hint ({s.source or 'general'}): {s.description}"
+            for s in skills
+        )
+
+    # Default: HyperSkill (terse, advantage-aware)
     lines = []
     for skill in skills:
-        # Compact one-line form; description already short
         lines.append(f"{skill.name}: {skill.description}")
     return " | ".join(lines)
 
@@ -287,6 +333,7 @@ def build_skill_augmented_prompt(
     skills: list,
     tool_desc: str = "",
     skill_summary: str = None,
+    skill_style: str = "hyperskill",
 ) -> str:
     """Build a skill-augmented initial prompt.
 
@@ -300,6 +347,7 @@ def build_skill_augmented_prompt(
     base = build_initial_prompt(question, modality, task_type, tool_desc=tool_desc)
     if not has_skills:
         return base
-    skill_ctx = skill_summary if skill_summary is not None else format_skills_context(skills)
+    skill_ctx = (skill_summary if skill_summary is not None
+                 else format_skills_context(skills, style=skill_style))
     skill_header = SKILL_AUGMENTED_PROMPT.format(skills_context=skill_ctx)
     return skill_header + "\n\n" + base
