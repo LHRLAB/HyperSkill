@@ -223,3 +223,6 @@ baseline*
 PAPER*.md
 .claude/
 cache/
+Latex/
+plot/
+related*/
