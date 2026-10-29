@@ -37,7 +37,7 @@ We evaluate on HyperSkill-Bench, 11 public datasets in four regimes:
 | VL-Doc | DocBench, MMLongBench-Doc |
 | Omni | OmniVideoBench, WorldSense |
 
-Download the processed HyperSkill-Bench from Hugging Face (coming soon) into `dataset/` in the repository root:
+Download the processed HyperSkill-Bench from [Hugging Face](https://huggingface.co/datasets/LHRLAB/HyperSkill) into `dataset/` in the repository root:
 
 ```bash
 pip install -U huggingface_hub
