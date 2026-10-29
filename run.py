@@ -1,17 +1,14 @@
 """
 HyperSkill unified launcher.
 
-Three one-line commands reproduce the Zero-shot and HyperSkill (Ours)
-columns of the main results table (each runs all 11 datasets in parallel,
-one subprocess per dataset):
+One-line commands run HyperSkill on all 11 datasets in parallel
+(one subprocess per dataset):
 
-    python run.py --zero-shot      # evaluate frozen LLM without any skills
     python run.py --train          # self-evolve skill libraries on all datasets
     python run.py --eval           # evaluate skill-augmented policy on all datasets
 
 Single-dataset usage:
 
-    python run.py --zero-shot --dataset AIME2024
     python run.py --train     --dataset AIME2024
     python run.py --eval      --dataset OmniVideoBench
 """
@@ -57,8 +54,6 @@ def _run_parallel(mode_flag: str, datasets: list[str], extra: list[str]) -> int:
 def main() -> None:
     ap = argparse.ArgumentParser(description="HyperSkill launcher")
     mode = ap.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--zero-shot", action="store_true",
-                      help="Evaluate frozen LLM without skill retrieval")
     mode.add_argument("--train",     action="store_true",
                       help="Self-evolve the skill library")
     mode.add_argument("--eval",      action="store_true",
@@ -72,12 +67,7 @@ def main() -> None:
     ap.add_argument("--split",       default="test")
     args = ap.parse_args()
 
-    if args.train:
-        mode_flag = "--train"
-    elif args.eval:
-        mode_flag = "--eval"
-    else:
-        mode_flag = "--zero-shot"
+    mode_flag = "--train" if args.train else "--eval"
 
     extra: list[str] = []
     if args.train:

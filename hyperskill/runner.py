@@ -129,11 +129,10 @@ async def evaluate_one(
     split: str = "test",
     max_samples: int | None = None,
     batch_size: int = 4,
-    use_skills: bool = True,
 ) -> dict:
     cfg = _build_cfg(ds_name, mode="test")
 
-    tag = "HyperSkill" if use_skills else "Zero-shot"
+    tag = "HyperSkill"
     print(f"[{ds_name}] {tag} · modality={cfg.data.modality} · split={split}", flush=True)
     dataset = HyperSkillDataset(ds_name, split=split,
                                 max_samples=max_samples, dataset_root=DATASET_ROOT)
@@ -141,16 +140,13 @@ async def evaluate_one(
     print(f"[{ds_name}] {len(dataset)} samples", flush=True)
 
     trainer = HyperSkillGRPOTrainer(cfg)
-    metrics = await trainer.evaluate(loader, use_skills=use_skills)
+    metrics = await trainer.evaluate(loader)
     metrics["dataset"]  = ds_name
     metrics["modality"] = cfg.data.modality
-    # Kept (always empty) so the result-JSON schema matches released results.
-    metrics["ablation"] = ""
-    metrics["baseline"] = ""
 
     out_dir = PROJECT_ROOT / cfg.output_dir / cfg.exp_name
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = "eval_results.json" if use_skills else "eval_zeroshot.json"
+    out_file = "eval_results.json"
     (out_dir / out_file).write_text(json.dumps(metrics, indent=2))
 
     bm = metrics.get("bootstrap_mean", metrics.get("f1", 0))
@@ -170,8 +166,6 @@ def _main():
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--train",      action="store_true")
     mode.add_argument("--eval",       action="store_true")
-    mode.add_argument("--zero-shot",  action="store_true",
-                      help="Evaluate without skill retrieval (frozen LLM only)")
     p.add_argument("--dataset",     required=True, help="Dataset key, e.g. AIME2024")
     p.add_argument("--epochs",      type=int, default=1)
     p.add_argument("--resume",      action="store_true")
@@ -186,8 +180,7 @@ def _main():
     else:
         asyncio.run(evaluate_one(args.dataset, split=args.split,
                                  max_samples=args.max_samples,
-                                 batch_size=args.batch_size,
-                                 use_skills=args.eval))
+                                 batch_size=args.batch_size))
 
 
 if __name__ == "__main__":

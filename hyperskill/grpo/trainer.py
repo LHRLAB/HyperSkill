@@ -641,8 +641,7 @@ class HyperSkillGRPOTrainer:
         """Run evaluation without skill library updates.
 
         Args:
-            use_skills: if False, run zero-shot (skip skill retrieval entirely).
-                        Otherwise apply test-time retrieval gating
+            use_skills: apply test-time skill retrieval gating
                         (test_top_k + test_min_similarity).
         """
         all_f1: List[float] = []
@@ -658,10 +657,8 @@ class HyperSkillGRPOTrainer:
 
         async def _eval_one(item, skills):
             async with eval_sem:
-                # Apples-to-apples: BOTH Zero-shot and HyperSkill use the same
-                # tool stack (SerpAPI/BM25/video-frames/audio). The only
-                # difference is whether the evolving skill library is consulted.
-                # This isolates the contribution of the skill hypergraph itself.
+                # Tool stack (SerpAPI/BM25/video-frames/audio) for this item;
+                # the evolving skill library is consulted on top of it.
                 tools = build_tools(
                     task_type=item.task_type,
                     dataset_name=item.source,

@@ -181,8 +181,7 @@ def sync_llm_call_with_images(
     where both video frames AND audio are required to answer.
     """
     # Cache key: hash of prompt + system + image hashes + audio hash.
-    # This makes vision/audio calls byte-reproducible across eval runs —
-    # critical for the Zero-shot vs HyperSkill paired comparison.
+    # This makes vision/audio calls byte-reproducible across eval runs.
     img_fp = "".join(hashlib.sha256(b.encode()).hexdigest()[:8] for b in image_b64_list)
     aud_fp = hashlib.sha256(audio_bytes).hexdigest()[:16] if audio_bytes else ""
     ck = _cache_key(f"{system}\n{prompt}\n[img:{img_fp}][aud:{aud_fp}]", cfg.model)

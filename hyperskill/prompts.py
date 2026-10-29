@@ -212,7 +212,7 @@ def build_skill_augmented_prompt(
     """Build a skill-augmented initial prompt.
 
     When NO skill passes the retrieval gates, fall back to the plain
-    zero-shot prompt (byte-identical to the Zero-shot run) — no
+    initial prompt — no
     "(No relevant skills found)" banner is injected, since it adds
     irrelevant tokens that can perturb the model.
     """

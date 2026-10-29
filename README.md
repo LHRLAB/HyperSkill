@@ -60,12 +60,12 @@ OmniVideoBench uses 8 video keyframes only; WorldSense uses 8 keyframes plus the
 ## 3. Implementation
 
 ```bash
-python run.py --zero-shot && python run.py --train && python run.py --eval
+python run.py --train && python run.py --eval
 ```
 
-Each step runs all 11 datasets in parallel (logs in `outputs/logs/`). Results are written to `outputs/hyperskill_<dataset>/eval_zeroshot.json` (Zero-shot) and `eval_results.json` (HyperSkill).
+Each step runs all 11 datasets in parallel (logs in `outputs/logs/`). Results are written to `outputs/hyperskill_<dataset>/eval_results.json`.
 
-`--eval` loads the skill library produced by `--train`; without it, no skills are retrieved (equivalent to Zero-shot).
+`--eval` loads the skill library produced by `--train`.
 
 Files written at runtime:
 
