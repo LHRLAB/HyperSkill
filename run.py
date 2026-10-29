@@ -1,8 +1,9 @@
 """
 HyperSkill unified launcher.
 
-Three one-line commands reproduce all reported numbers (each runs all 11
-datasets in parallel, one subprocess per dataset):
+Three one-line commands reproduce the Zero-shot and HyperSkill (Ours)
+columns of the main results table (each runs all 11 datasets in parallel,
+one subprocess per dataset):
 
     python run.py --zero-shot      # evaluate frozen LLM without any skills
     python run.py --train          # self-evolve skill libraries on all datasets
@@ -18,7 +19,6 @@ Single-dataset usage:
 from __future__ import annotations
 
 import argparse
-import os
 import subprocess
 import sys
 import time

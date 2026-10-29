@@ -1,11 +1,12 @@
 # HyperSkill — Vision-Language modality config
 # Datasets: FVQA, InfoSeek, SimpleVQA, LiveVQA, DocBench, MMLongBench-Doc
-# Override any field here; _cfg_from_dataset() merges these on top of defaults.
+# runner._build_cfg() loads these on top of the config.py dataclass defaults;
+# in eval mode runner._EVAL_RETRIEVAL then overrides the test_* fields.
 
 llm:
-  base_url: https://api.apiyi.com/v1
-  model: gemini-3.1-flash-lite-preview
-  embedding_model: gemini-embedding-2-preview
+  base_url: https://openrouter.ai/api/v1
+  model: google/gemini-3.1-flash-lite-preview
+  embedding_model: google/gemini-embedding-2-preview
   embedding_dim: 3072
   max_tokens: 2048
   temperature: 1.0       # bumped from 0.7 — diversify rollouts so GRPO has variance
@@ -14,9 +15,7 @@ llm:
 
 hypergraph:
   top_k: 10
-  test_top_k: 1                # VL answers are short entities; extra skills dilute
-  test_min_similarity: 0.2     # VL queries semantically diverse; let top candidates pass
-  test_min_advantage: 0.15     # VL: moderate floor — prompt is now terse, less disruptive
+  test_min_similarity: 0.2     # training-time retrieval floor (eval overrides to 0.0)
   skill_dedup_threshold: 1.0
   eta: 0.1
   beta: 0.01
@@ -29,6 +28,4 @@ rollout:
   max_gen_round: 5
   max_prompt_length: 6144
   max_new_tokens: 1024
-  image_search_limit: 2
   text_search_limit: 2
-  max_search_tokens: 1200

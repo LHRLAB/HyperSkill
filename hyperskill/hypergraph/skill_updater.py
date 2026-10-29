@@ -16,10 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from ..config import LLMConfig
 from ..llm import async_llm_call
@@ -288,7 +287,6 @@ class SkillUpdater:
               f"no_split={skip_no_split[0]}, empty_extract={empty_extract[0]}")
         # Stash debug counts on self for the caller (lists can't take attrs)
         self._last_no_variance = skip_no_var[0]
-        self._last_no_split    = skip_no_split[0]
         return results
 
     # ── Stage 2: Counterfactual verification ──────────────────────────────

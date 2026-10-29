@@ -20,11 +20,11 @@ CONFIGS_DIR = Path(__file__).parent / "configs"
 
 @dataclass
 class LLMConfig:
-    """LLM and embedding model settings (apiyi + Gemini)."""
-    base_url: str = "https://api.apiyi.com/v1"
-    api_key: str = ""                            # fallback to api_key_apiyi.txt or env
-    model: str = "gemini-3.1-flash-lite-preview"
-    embedding_model: str = "gemini-embedding-2-preview"
+    """LLM and embedding model settings (OpenRouter + Gemini)."""
+    base_url: str = "https://openrouter.ai/api/v1"
+    api_key: str = ""                            # fallback to api_key_openrouter.txt or env
+    model: str = "google/gemini-3.1-flash-lite-preview"
+    embedding_model: str = "google/gemini-embedding-2-preview"
     embedding_dim: int = 3072
     max_tokens: int = 2048
     temperature: float = 0.7
@@ -36,12 +36,12 @@ class LLMConfig:
 class HypergraphConfig:
     """Omni-modal weighted hypergraph settings."""
     working_dir: str = "expr/skill_library"
-    chunk_size: int = 512
-    chunk_overlap: int = 64
     top_k: int = 10
-    # Retrieval quality gating (applied at test/inference time)
+    # Retrieval gating. test_top_k / test_min_advantage are only read at eval
+    # time (set by runner._EVAL_RETRIEVAL); test_min_similarity is ALSO the
+    # similarity floor for training-time retrieval (trainer.train_batch).
     test_top_k: int = 3              # max skills injected during inference
-    test_min_similarity: float = 0.2 # discard hits below this cosine similarity at inference
+    test_min_similarity: float = 0.2 # discard hits below this cosine similarity
     test_min_advantage:  float = 0.0 # require learned advantage ≥ this to inject the skill
     # Skill deduplication: cosine similarity threshold for near-duplicate suppression.
     # Set to 1.0 to disable during training (avoids expensive merge LLM calls).
@@ -105,50 +105,26 @@ class HyperSkillConfig:
     data: DataConfig = field(default_factory=DataConfig)
     early_stop: EarlyStopConfig = field(default_factory=EarlyStopConfig)
 
-    policy_model: str = "gemini-3.1-flash-lite-preview"
+    policy_model: str = "google/gemini-3.1-flash-lite-preview"
     mode: str = "train"              # "train" | "test"
     exp_name: str = "hyperskill_exp"
     output_dir: str = "outputs"
     seed: int = 42
-    use_wandb: bool = False
-    wandb_project: str = "hyperskill"
 
 
 # ---------------------------------------------------------------------------
 # Loader
 # ---------------------------------------------------------------------------
 
-def _dict_to_dataclass(dc_type, d: Dict[str, Any]):
-    """Recursively instantiate a dataclass from a dict."""
-    if d is None:
-        return dc_type()
-    fields_map = {f.name: f for f in dc_type.__dataclass_fields__.values()}
-    kwargs = {}
-    for key, val in d.items():
-        if key not in fields_map:
-            continue
-        f = fields_map[key]
-        # check if the field type is also a dataclass
-        ft = f.type if isinstance(f.type, type) else None
-        if ft is not None and hasattr(ft, "__dataclass_fields__") and isinstance(val, dict):
-            kwargs[key] = _dict_to_dataclass(ft, val)
-        else:
-            kwargs[key] = val
-    return dc_type(**kwargs)
-
-
-def load_config(yaml_path: str, base: Optional["HyperSkillConfig"] = None) -> "HyperSkillConfig":
+def load_config(yaml_path: str) -> "HyperSkillConfig":
     """
-    Load a YAML config file into a HyperSkillConfig dataclass.
-
-    If `base` is provided, only fields present in the YAML override it
-    (partial/overlay mode). Otherwise a fresh config is built from defaults
-    plus whatever the YAML specifies.
+    Load a YAML config file into a HyperSkillConfig dataclass: defaults plus
+    whatever fields the YAML specifies.
     """
     with open(yaml_path, "r", encoding="utf-8") as f:
         raw: Dict[str, Any] = yaml.safe_load(f) or {}
 
-    cfg = base if base is not None else HyperSkillConfig()
+    cfg = HyperSkillConfig()
 
     # Sub-config sections — overlay only fields present in YAML
     for section, dc_type, attr in (
@@ -166,12 +142,12 @@ def load_config(yaml_path: str, base: Optional["HyperSkillConfig"] = None) -> "H
 
     # Top-level scalars
     for key in ("policy_model", "mode", "exp_name",
-                "output_dir", "seed", "use_wandb", "wandb_project"):
+                "output_dir", "seed"):
         if key in raw:
             setattr(cfg, key, raw[key])
 
     # API key: YAML > env var
     if not cfg.llm.api_key:
-        cfg.llm.api_key = os.environ.get("OPENAI_API_KEY", "")
+        cfg.llm.api_key = os.environ.get("OPENROUTER_API_KEY", "")
 
     return cfg

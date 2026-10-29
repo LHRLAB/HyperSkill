@@ -72,41 +72,6 @@ Now provide your next step:
 """
 
 # ---------------------------------------------------------------------------
-# Skill extraction prompt (used by the hypergraph extractor)
-# ---------------------------------------------------------------------------
-
-SKILL_EXTRACTION_PROMPT = """\
-You are a skill extraction expert. Extract 2-5 reusable reasoning skills from the trajectory below.
-
-Each skill must be a generalizable procedure or strategy, NOT specific to this question.
-Output each skill on its own line in EXACTLY this format (pipe-separated):
-SKILL: <short name (3-7 words)> | <description: what to do and when (1-2 sentences)> | <modality: text/image/audio/video/pdf/mixed> | <hop_type: single/multi>
-
-Output ONLY SKILL lines. No other text.
-
-Reasoning trajectory:
-{trajectory}
-"""
-
-# ---------------------------------------------------------------------------
-# Skill summarization prompt (merge two similar skills)
-# ---------------------------------------------------------------------------
-
-SKILL_MERGE_PROMPT = """\
-Two similar skills have been identified. Merge them into a single, more
-comprehensive skill.
-
-Skill A:
-{skill_a}
-
-Skill B:
-{skill_b}
-
-Output a merged skill as a JSON object with fields: name, description,
-modality, hop_type, examples. JSON only, no markdown.
-"""
-
-# ---------------------------------------------------------------------------
 # Contrastive step-level skill distillation + counterfactual verification
 # ---------------------------------------------------------------------------
 SKILL_CONTRASTIVE_EXTRACT_SP = """\
@@ -209,80 +174,15 @@ Tip from prior experience: {skills_context}
 """
 
 # ---------------------------------------------------------------------------
-# Skill summary prompt — synthesize retrieved skills into a concise hint
-# ---------------------------------------------------------------------------
-
-SKILL_SUMMARY_PROMPT = """\
-Given a question and a set of retrieved reasoning skills, write a concise \
-strategy hint (2-3 sentences) that synthesizes these skills specifically for \
-this question. Focus on HOW to combine them, not just listing them.
-
-Question: {question}
-
-Retrieved Skills:
-{skills_raw}
-
-Strategy hint (2-3 sentences, actionable):"""
-
-# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def format_skills_context(skills: list, style: str = "hyperskill") -> str:
-    """Format retrieved skills for prompt injection.
-
-    `style` controls the surface form so different baselines produce different
-    LLM inputs (otherwise deterministic decoding yields identical outputs).
-    """
+def format_skills_context(skills: list) -> str:
+    """Format retrieved skills for prompt injection."""
     if not skills:
         return "(No relevant skills found)"
 
-    if style == "trainingfreegrpo":
-        # Flat experience dictionary entries
-        return " || ".join(f"[EXP {i+1}] {s.name} — {s.description}"
-                           for i, s in enumerate(skills))
-
-    if style == "skillcraft":
-        # Code-card style: one "function" per skill
-        parts = []
-        for i, s in enumerate(skills):
-            parts.append(
-                f"# Skill #{i+1}\n"
-                f"def {s.name.lower().replace(' ', '_')}():\n"
-                f"    \"\"\"{s.description}\"\"\"\n"
-                f"    return step_by_step_procedure()"
-            )
-        return "\n".join(parts)
-
-    if style == "autoskill":
-        # Bullet-list of generic tips
-        return "\n".join(f"• Tip: {s.description}" for s in skills)
-
-    if style == "evoskill":
-        # Frontier-style annotated skills
-        return "\n".join(
-            f"▶ [frontier-skill, adv={s.advantage:.2f}] {s.name}: {s.description}"
-            for s in skills
-        )
-
-    if style == "mementoskills":
-        # Retrieved case framed as an episodic memory
-        parts = []
-        for i, s in enumerate(skills):
-            parts.append(
-                f"[Memory {i+1}] Recall a similar past case — when solving a problem of type "
-                f"\"{s.name}\", the following reasoning worked: {s.description}"
-            )
-        return "\n".join(parts)
-
-    if style == "xskill":
-        # Cross-task hint framing
-        return "\n".join(
-            f"◆ Cross-task hint ({s.source or 'general'}): {s.description}"
-            for s in skills
-        )
-
-    # Default: HyperSkill (terse, advantage-aware)
+    # HyperSkill format (terse)
     lines = []
     for skill in skills:
         lines.append(f"{skill.name}: {skill.description}")
@@ -302,52 +202,23 @@ def build_initial_prompt(
     return base + f"\n\nHere is the question:\n{question}"
 
 
-async def summarize_skills(question: str, skills: list, llm_cfg) -> str:
-    """
-    Call LLM to synthesize retrieved skills into a concise, question-aware hint.
-    Falls back to raw format_skills_context if LLM call fails.
-    """
-    if not skills:
-        return "(No relevant skills found)"
-    from .llm import async_llm_call
-    skills_raw = format_skills_context(skills)
-    prompt = SKILL_SUMMARY_PROMPT.format(question=question, skills_raw=skills_raw)
-    try:
-        summary = await async_llm_call(
-            prompt=prompt,
-            cfg=llm_cfg,
-            system="You are a concise math reasoning coach.",
-            use_cache=True,
-            max_tokens=150,
-            temperature=0.2,
-        )
-        return summary.strip()
-    except Exception:
-        return skills_raw
-
-
 def build_skill_augmented_prompt(
     question: str,
     modality: str,
     task_type: str,
     skills: list,
     tool_desc: str = "",
-    skill_summary: str = None,
-    skill_style: str = "hyperskill",
 ) -> str:
     """Build a skill-augmented initial prompt.
 
     When NO skill passes the retrieval gates, fall back to the plain
-    zero-shot prompt so HyperSkill ≥ Zero-shot on datasets where the skill
-    library doesn't (yet) help — no "(No relevant skills found)" banner is
-    injected, since it adds irrelevant tokens that can perturb the model.
+    zero-shot prompt (byte-identical to the Zero-shot run) — no
+    "(No relevant skills found)" banner is injected, since it adds
+    irrelevant tokens that can perturb the model.
     """
-    has_skills = bool(skills) or (skill_summary is not None and skill_summary.strip()
-                                  and skill_summary.strip() != "(No relevant skills found)")
     base = build_initial_prompt(question, modality, task_type, tool_desc=tool_desc)
-    if not has_skills:
+    if not skills:
         return base
-    skill_ctx = (skill_summary if skill_summary is not None
-                 else format_skills_context(skills, style=skill_style))
+    skill_ctx = format_skills_context(skills)
     skill_header = SKILL_AUGMENTED_PROMPT.format(skills_context=skill_ctx)
     return skill_header + "\n\n" + base

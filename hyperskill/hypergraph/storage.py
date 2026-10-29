@@ -3,7 +3,7 @@ Storage backends for the omni-modal weighted hypergraph.
 
 Three backends:
   - JsonKVStorage   : persistent JSON key-value store (skills, hyperedges metadata)
-  - VectorStorage   : nano_vectordb wrapper for embedding similarity search
+  - VectorStorage   : in-memory numpy store for embedding similarity search
   - GraphStorage    : NetworkX directed graph persisted as GraphML
 
 All paths are relative to a working directory configured in HypergraphConfig.
@@ -45,39 +45,14 @@ class JsonKVStorage:
     def delete(self, key: str) -> None:
         self._data.pop(key, None)
 
-    def all_keys(self) -> List[str]:
-        return list(self._data.keys())
-
-    def all_values(self) -> List[Any]:
-        return list(self._data.values())
-
-    def items(self):
-        return self._data.items()
-
     def __len__(self) -> int:
         return len(self._data)
-
-    def __contains__(self, key: str) -> bool:
-        return key in self._data
 
     # -- Persistence --------------------------------------------------------
 
     def save(self) -> None:
         with open(self._path, "w", encoding="utf-8") as f:
             json.dump(self._data, f, ensure_ascii=False, indent=2)
-
-    def load(self) -> None:
-        if os.path.exists(self._path):
-            with open(self._path, "r", encoding="utf-8") as f:
-                self._data = json.load(f)
-
-    # -- Filtered queries ---------------------------------------------------
-
-    def filter_by_field(self, field: str, value: Any) -> List[Dict[str, Any]]:
-        return [v for v in self._data.values() if isinstance(v, dict) and v.get(field) == value]
-
-    def filter_by_source(self, source: str) -> List[Dict[str, Any]]:
-        return self.filter_by_field("source", source)
 
 
 # ---------------------------------------------------------------------------
@@ -110,10 +85,6 @@ class VectorStorage:
         return key in self._id_to_idx
 
     # -- Upsert / Query -----------------------------------------------------
-
-    def upsert(self, key: str, vec: np.ndarray) -> None:
-        """Single-item upsert. Delegates to upsert_batch for consistency."""
-        self.upsert_batch([(key, vec)])
 
     def upsert_batch(self, items: List[Tuple[str, np.ndarray]]) -> None:
         """
@@ -166,7 +137,6 @@ class VectorStorage:
         self,
         vec: np.ndarray,
         top_k: int = 10,
-        exclude_keys: Optional[List[str]] = None,
     ) -> List[Tuple[str, float]]:
         """Return top_k (key, cosine_similarity) pairs, sorted descending."""
         if self._vecs is None or not self._ids:
@@ -176,11 +146,9 @@ class VectorStorage:
         if norm > 0:
             v = v / norm
         sims = self._vecs @ v  # (N,)
-        exclude_set = set(exclude_keys or [])
         results = [
             (self._ids[i], float(sims[i]))
             for i in range(len(self._ids))
-            if self._ids[i] not in exclude_set
         ]
         results.sort(key=lambda x: -x[1])
         return results[:top_k]
@@ -269,37 +237,13 @@ class GraphStorage:
         if self._graph.has_node(node_id):
             self._graph.remove_node(node_id)
 
-    def all_nodes(
-        self, node_type: Optional[str] = None
-    ) -> List[Tuple[str, Dict[str, Any]]]:
-        if node_type is None:
-            return [(n, dict(d)) for n, d in self._graph.nodes(data=True)]
-        return [
-            (n, dict(d))
-            for n, d in self._graph.nodes(data=True)
-            if d.get("node_type") == node_type
-        ]
-
     # -- Edge operations ----------------------------------------------------
-
-    def has_edge(self, src: str, dst: str) -> bool:
-        return self._graph.has_edge(src, dst)
 
     def upsert_edge(self, src: str, dst: str, **attrs) -> None:
         if self._graph.has_edge(src, dst):
             self._graph.edges[src, dst].update(attrs)
         else:
             self._graph.add_edge(src, dst, **attrs)
-
-    def get_neighbors(self, node_id: str) -> List[str]:
-        if not self._graph.has_node(node_id):
-            return []
-        return list(self._graph.successors(node_id))
-
-    def node_degree(self, node_id: str) -> int:
-        if not self._graph.has_node(node_id):
-            return 0
-        return self._graph.degree(node_id)
 
     # -- Bulk queries -------------------------------------------------------
 
@@ -329,7 +273,3 @@ class GraphStorage:
 
     def save(self) -> None:
         nx.write_graphml(self._graph, self._path)
-
-    def load(self) -> None:
-        if os.path.exists(self._path):
-            self._graph = nx.read_graphml(self._path)

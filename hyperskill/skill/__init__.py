@@ -1,5 +1,5 @@
 """Skill models and library package."""
-from .models import SkillNode, SkillHyperedge
+from .models import SkillNode
 from .library import SkillLibrary
 
-__all__ = ["SkillNode", "SkillHyperedge", "SkillLibrary"]
+__all__ = ["SkillNode", "SkillLibrary"]

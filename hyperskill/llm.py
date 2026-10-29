@@ -1,11 +1,11 @@
 """
 LLM and embedding utilities for HyperSkill.
 
-apiyi integration for HyperSkill:
-  - Sync OpenAI client pointing at https://api.apiyi.com/v1
-  - API key from api_key_apiyi.txt (project root) or OPENAI_API_KEY env var
-  - Generation model : gemini-3.1-flash-lite-preview
-  - Embedding model  : gemini-embedding-2-preview  (dim=3072)
+OpenRouter integration for HyperSkill:
+  - Sync OpenAI client pointing at https://openrouter.ai/api/v1
+  - API key from api_key_openrouter.txt (project root) or OPENROUTER_API_KEY env var
+  - Generation model : google/gemini-3.1-flash-lite-preview
+  - Embedding model  : google/gemini-embedding-2-preview  (dim=3072)
   - Audio/image sent as base64 data URLs via chat completions (no Whisper)
   - ThreadPoolExecutor for parallel batch embedding
   - Async wrappers run sync calls in the default executor
@@ -16,8 +16,6 @@ Public API
   sync_llm_call_with_images(prompt, image_b64_list, cfg) -> str
   sync_embed_texts(texts, cfg) -> np.ndarray  shape (N, dim)
   sync_embed_image_bytes(image_bytes, cfg) -> np.ndarray  shape (dim,)
-  sync_transcribe_audio(audio_bytes, cfg, fmt) -> str
-  sync_caption_video_frame(frame_bytes, transcript, cfg) -> str
 
   async_llm_call(...)              — thin async wrapper
   async_llm_call_with_images(...)  — thin async wrapper
@@ -30,7 +28,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-import io
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -51,11 +48,11 @@ logger = logging.getLogger(__name__)
 def _resolve_api_key(cfg: LLMConfig) -> str:
     if cfg.api_key:
         return cfg.api_key
-    # Look for api_key_apiyi.txt in project root (two levels up from this file)
-    key_file = Path(__file__).parent.parent / "api_key_apiyi.txt"
+    # Look for api_key_openrouter.txt in project root (two levels up from this file)
+    key_file = Path(__file__).parent.parent / "api_key_openrouter.txt"
     if key_file.exists():
         return key_file.read_text(encoding="utf-8").strip()
-    return os.environ.get("OPENAI_API_KEY", "")
+    return os.environ.get("OPENROUTER_API_KEY", "")
 
 
 # ---------------------------------------------------------------------------
@@ -84,8 +81,7 @@ def _get_client(cfg: LLMConfig) -> OpenAI:
 # exhibits ~1-3% variation across calls without this layer. Disabled by
 # HYPERSKILL_DISABLE_LLM_CACHE=1.
 
-from pathlib import Path as _Path
-_LLM_CACHE_DIR = _Path(__file__).resolve().parent.parent / "cache" / "llm"
+_LLM_CACHE_DIR = Path(__file__).resolve().parent.parent / "cache" / "llm"
 _llm_cache: dict = {}
 _MAX_CACHE = 16384
 
@@ -94,7 +90,7 @@ def _cache_key(prompt: str, model: str) -> str:
     return hashlib.sha256(f"{model}::{prompt}".encode()).hexdigest()
 
 
-def _disk_path(ck: str) -> _Path:
+def _disk_path(ck: str) -> Path:
     sub = _LLM_CACHE_DIR / ck[:2]
     sub.mkdir(parents=True, exist_ok=True)
     return sub / f"{ck}.txt"
@@ -141,7 +137,7 @@ def sync_llm_call(
     max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
 ) -> str:
-    """Single-turn text completion via apiyi + Gemini."""
+    """Single-turn text completion via OpenRouter + Gemini."""
     ck = _cache_key(prompt, cfg.model)
     if use_cache:
         hit = _cache_get(ck)
@@ -226,62 +222,6 @@ def sync_llm_call_with_images(
     if use_cache:
         _cache_set(ck, text)
     return text
-
-
-# ---------------------------------------------------------------------------
-# Sync audio transcription via Gemini (no Whisper endpoint needed)
-# ---------------------------------------------------------------------------
-
-_AUDIO_FMT_MIME = {
-    "wav":  "audio/wav",
-    "mp3":  "audio/mpeg",
-    "flac": "audio/flac",
-    "m4a":  "audio/mp4",
-    "ogg":  "audio/ogg",
-}
-
-def sync_transcribe_audio(
-    audio_bytes: bytes,
-    cfg: LLMConfig,
-    fmt: str = "wav",
-) -> str:
-    """
-    Transcribe audio by sending it as a base64 data URL to Gemini.
-    Uses the 'input_audio' content part via apiyi chat completions.
-    """
-    client = _get_client(cfg)
-    mime = _AUDIO_FMT_MIME.get(fmt, "audio/wav")
-    b64 = base64.b64encode(audio_bytes).decode("utf-8")
-    try:
-        resp = client.chat.completions.create(
-            model=cfg.model,
-            messages=[{"role": "user", "content": [
-                {"type": "input_audio", "input_audio": {"data": b64, "format": fmt}},
-                {"type": "text", "text": "Please transcribe this audio accurately. Output only the transcript."},
-            ]}],
-            max_tokens=2048,
-        )
-        return resp.choices[0].message.content or ""
-    except Exception as e:
-        logger.warning("Audio transcription failed: %s", e)
-        return ""
-
-
-def sync_caption_video_frame(
-    frame_bytes: bytes,
-    transcript: str,
-    cfg: LLMConfig,
-    start: float = 0.0,
-    end: float = 0.0,
-) -> str:
-    """Caption a video keyframe with context from its transcript."""
-    b64 = base64.b64encode(frame_bytes).decode("utf-8")
-    prompt = (
-        f"Keyframe from video segment [{start:.1f}s-{end:.1f}s]. "
-        f"Transcript: '{transcript[:300]}'. "
-        "Describe what you see and relate it to the spoken content."
-    )
-    return sync_llm_call_with_images(prompt, [b64], cfg, max_tokens=300)
 
 
 # ---------------------------------------------------------------------------
@@ -406,12 +346,3 @@ async def async_embed_image(image_bytes: bytes, cfg: LLMConfig) -> np.ndarray:
     fn = functools.partial(sync_embed_image_bytes, image_bytes, cfg)
     return await _run_in_executor(fn)
 
-
-async def async_transcribe_audio(
-    audio_bytes: bytes,
-    cfg: LLMConfig,
-    fmt: str = "wav",
-) -> str:
-    import functools
-    fn = functools.partial(sync_transcribe_audio, audio_bytes, cfg, fmt)
-    return await _run_in_executor(fn)

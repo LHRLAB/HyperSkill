@@ -5,14 +5,12 @@ used by the trainer and agents.
 """
 
 from __future__ import annotations
-import os
-import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from ..config import HypergraphConfig, LLMConfig
 from ..hypergraph.builder import HypergraphBuilder
 from ..hypergraph.retriever import HypergraphRetriever
-from .models import SkillNode, SkillHyperedge
+from .models import SkillNode
 
 
 class SkillLibrary:
@@ -23,14 +21,8 @@ class SkillLibrary:
     -----
     library = SkillLibrary(hcfg, llm_cfg)
 
-    # Add experience from a training trajectory
-    await library.evolve(trajectory, advantage, source, modality, hop_type)
-
     # Retrieve relevant skills for a new question
     skills = await library.retrieve(question, top_k=5)
-
-    # Build skill-augmented prompt
-    prompt = library.build_prompt(question, skills)
     """
 
     def __init__(self, cfg: HypergraphConfig, llm_cfg: LLMConfig):
@@ -52,45 +44,6 @@ class SkillLibrary:
         )
 
     # ------------------------------------------------------------------
-    # Evolution
-    # ------------------------------------------------------------------
-
-    async def evolve(
-        self,
-        trajectory: str,
-        advantage: float,
-        source: str,
-        modality: str = "text",
-        hop_type: str = "single",
-        extra_media: Optional[List[Tuple[str, bytes]]] = None,
-    ) -> int:
-        """
-        Update the skill library from one trajectory experience.
-
-        High-advantage trajectories contribute skills with more influence;
-        low/negative-advantage trajectories down-weight existing skills.
-
-        Returns number of new skills inserted.
-        """
-        n = await self.builder.insert_experience(
-            trajectory=trajectory,
-            advantage=advantage,
-            source=source,
-            modality=modality,
-            hop_type=hop_type,
-            extra_media=extra_media,
-        )
-        return n
-
-    async def batch_evolve(
-        self,
-        experiences: List[Dict[str, Any]],
-        max_concurrent: int = 4,
-    ) -> int:
-        """Batch evolve from multiple experiences."""
-        return await self.builder.batch_insert_experiences(experiences, max_concurrent)
-
-    # ------------------------------------------------------------------
     # Retrieval
     # ------------------------------------------------------------------
 
@@ -99,8 +52,6 @@ class SkillLibrary:
         query: str,
         top_k: Optional[int] = None,
         image_bytes: Optional[bytes] = None,
-        source_filter: Optional[str] = None,
-        modality_filter: Optional[str] = None,
     ) -> List[SkillNode]:
         """
         Retrieve the most relevant skills for a query.
@@ -110,8 +61,6 @@ class SkillLibrary:
             query=query,
             top_k=top_k,
             image_bytes=image_bytes,
-            source_filter=source_filter,
-            modality_filter=modality_filter,
         )
         return [SkillNode.from_dict(r) for r in raw_results]
 
@@ -146,10 +95,6 @@ class SkillLibrary:
         """Save all storage backends to disk."""
         self.builder.save()
 
-    def load(self) -> None:
-        """Reload storage from disk (all backends auto-load on init)."""
-        pass  # Auto-loaded in HypergraphBuilder.__init__
-
     # ------------------------------------------------------------------
     # Info & statistics
     # ------------------------------------------------------------------
@@ -157,33 +102,3 @@ class SkillLibrary:
     def stats(self) -> Dict[str, Any]:
         """Return library statistics."""
         return self.builder.stats()
-
-    def list_skills(
-        self,
-        modality: Optional[str] = None,
-        source: Optional[str] = None,
-        min_advantage: float = -1.0,
-    ) -> List[SkillNode]:
-        """List all skills with optional filters."""
-        nodes = self.builder.graph.all_nodes(node_type="skill")
-        results = []
-        for node_id, node_attrs in nodes:
-            adv = node_attrs.get("advantage", 0.0)
-            if adv < min_advantage:
-                continue
-            mod = node_attrs.get("modality", "")
-            src = node_attrs.get("source", "")
-            if modality and mod != modality:
-                continue
-            if source and src != source:
-                continue
-            skill_data = self.builder.kv_skills.get(node_id)
-            if skill_data:
-                results.append(SkillNode.from_dict(skill_data))
-        # Sort by advantage descending
-        results.sort(key=lambda s: -s.advantage)
-        return results
-
-    def top_skills(self, n: int = 20) -> List[SkillNode]:
-        """Return the top-N highest advantage skills."""
-        return self.list_skills()[:n]

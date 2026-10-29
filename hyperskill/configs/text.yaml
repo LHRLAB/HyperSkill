@@ -1,11 +1,12 @@
 # HyperSkill — Text modality config
 # Datasets: AIME2024, AIME2025, WebWalkerQA
-# Override any field here; _cfg_from_dataset() merges these on top of defaults.
+# runner._build_cfg() loads these on top of the config.py dataclass defaults;
+# in eval mode runner._EVAL_RETRIEVAL then overrides the test_* fields.
 
 llm:
-  base_url: https://api.apiyi.com/v1
-  model: gemini-3.1-flash-lite-preview
-  embedding_model: gemini-embedding-2-preview
+  base_url: https://openrouter.ai/api/v1
+  model: google/gemini-3.1-flash-lite-preview
+  embedding_model: google/gemini-embedding-2-preview
   embedding_dim: 3072
   max_tokens: 2048
   temperature: 0.7
@@ -14,9 +15,7 @@ llm:
 
 hypergraph:
   top_k: 1                     # only the single most relevant skill
-  test_top_k: 2                # inject top 2 high-advantage skills for text/math
-  test_min_similarity: 0.6     # strict: only fire on highly relevant skills
-  test_min_advantage: 0.0      # text/math: skills are reliable, keep all positive-advantage
+  test_min_similarity: 0.6     # training-time retrieval floor (eval overrides to 0.0)
   skill_dedup_threshold: 1.0
   eta: 0.15
   beta: 0.01
@@ -29,6 +28,4 @@ rollout:
   max_gen_round: 3
   max_prompt_length: 4096
   max_new_tokens: 1024
-  image_search_limit: 0
   text_search_limit: 2
-  max_search_tokens: 800

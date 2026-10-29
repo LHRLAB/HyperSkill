@@ -6,7 +6,6 @@ Also supports image-based queries via caption embedding.
 """
 
 from __future__ import annotations
-import base64
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -56,8 +55,6 @@ class HypergraphRetriever:
         query: str,
         top_k: Optional[int] = None,
         image_bytes: Optional[bytes] = None,
-        source_filter: Optional[str] = None,
-        modality_filter: Optional[str] = None,
         min_similarity: Optional[float] = None,
         min_advantage: float = -2.0,
     ) -> List[Dict[str, Any]]:
@@ -68,8 +65,6 @@ class HypergraphRetriever:
             query          : text query string
             top_k          : number of results (defaults to cfg.top_k)
             image_bytes    : optional image for multimodal query
-            source_filter  : restrict to a specific dataset source
-            modality_filter: restrict to a specific modality
             min_similarity : cosine similarity floor (discard hits below this)
 
         Returns:
@@ -127,10 +122,6 @@ class HypergraphRetriever:
             # top-1 slot on a negative-advantage skill that would later be
             # dropped by the library-level post-filter.
             if skill_data.get("advantage", 0.0) < min_advantage:
-                continue
-            if source_filter and skill_data.get("source") != source_filter:
-                continue
-            if modality_filter and skill_data.get("modality") != modality_filter:
                 continue
             filtered.append((skill_id, sim, skill_data))
 

@@ -1,10 +1,9 @@
 """
 Reward functions for Training-Free GRPO in HyperSkill.
 
-Three reward signals:
+Two reward signals:
   1. F1 reward       — token-level F1 between predicted and ground-truth answers
-  2. Format reward   — structural validity of the response format
-  3. Search reward   — bonus for useful (non-repetitive) search calls
+  2. Format reward   — structural validity of the response format (logged only)
 """
 
 from __future__ import annotations
@@ -150,82 +149,6 @@ def compute_f1_reward(
     return max(_entity_containment(pred_text, g) for g in gold_answers)
 
 
-def _normalize_math(s: str) -> str:
-    """Normalize a math answer string for comparison.
-    Strips LaTeX wrappers, whitespace, trailing punctuation."""
-    s = s.strip()
-    # Strip $...$ delimiters
-    s = re.sub(r"^\$+|\$+$", "", s).strip()
-    # Strip \boxed{...}
-    m = re.match(r"\\boxed\{(.*)\}\s*$", s, re.DOTALL)
-    if m:
-        s = m.group(1).strip()
-    # Strip \text{...}
-    s = re.sub(r"\\text\{([^}]*)\}", r"\1", s)
-    # Remove all whitespace inside (matrix entries vary in spacing)
-    s = re.sub(r"\s+", "", s)
-    # Remove trailing periods
-    s = s.rstrip(".")
-    return s.lower()
-
-
-def compute_math_em_reward(
-    prediction: str,
-    gold_answers: Union[str, List[str]],
-) -> float:
-    """
-    Strict exact-match reward for math answers.
-
-    Pipeline:
-      1. ONLY look inside the LAST <answer>...</answer> tag (no tag → 0).
-      2. Try multiple normalization strategies:
-         (a) Single MC letter A-J → letter EM
-         (b) Single integer → integer EM
-         (c) Otherwise → normalized LaTeX/string EM
-      3. Compare against gold (try same strategies).
-    """
-    if isinstance(gold_answers, str):
-        gold_answers = [gold_answers]
-
-    # 1. Require <answer> tag
-    answer_match = re.findall(r"<answer>(.*?)</answer>", prediction, re.DOTALL)
-    if not answer_match:
-        return 0.0
-    pred_text = answer_match[-1].strip()
-
-    # 2a. MC letter (single letter A-J, optionally wrapped in (...))
-    pred_letter_m = re.match(r"^\(?([A-J])\)?\.?$", pred_text.strip())
-    if pred_letter_m:
-        pred_letter = pred_letter_m.group(1)
-        for gold in gold_answers:
-            g = str(gold).strip()
-            gm = re.match(r"^\(?([A-J])\)?\.?", g)
-            if gm and gm.group(1) == pred_letter:
-                return 1.0
-        return 0.0
-
-    # 2b. Pure integer
-    pred_nums = re.findall(r"-?\d+", pred_text)
-    is_pure_int = (len(pred_nums) == 1 and pred_text.strip().lstrip("-").isdigit())
-    if is_pure_int:
-        pred_int = int(pred_nums[0])
-        for gold in gold_answers:
-            gold_nums = re.findall(r"-?\d+", str(gold))
-            if gold_nums and len(gold_nums) == 1:
-                if int(gold_nums[0]) == pred_int:
-                    return 1.0
-        return 0.0
-
-    # 2c. Normalized LaTeX/string EM
-    pred_norm = _normalize_math(pred_text)
-    if not pred_norm:
-        return 0.0
-    for gold in gold_answers:
-        if _normalize_math(str(gold)) == pred_norm:
-            return 1.0
-    return 0.0
-
-
 # ---------------------------------------------------------------------------
 # Format rewards
 # ---------------------------------------------------------------------------
@@ -363,80 +286,14 @@ def compute_format_reward(
 
 
 # ---------------------------------------------------------------------------
-# Search utility reward
-# ---------------------------------------------------------------------------
-
-def compute_search_reward(response_list: List[str]) -> float:
-    """
-    Reward for useful (non-repetitive, relevant) search calls.
-    Penalizes repeated identical queries.
-    """
-    seen_queries: set = set()
-    score = 0.0
-    for resp in response_list:
-        text_searches = re.findall(r"<text_search>(.*?)</text_search>", resp)
-        for q in text_searches:
-            q = q.strip()
-            if q in seen_queries:
-                score -= 0.1  # penalty for repetition
-            else:
-                score += 0.05  # small bonus for unique searches
-                seen_queries.add(q)
-    return max(0.0, min(score, 0.3))  # cap bonus
-
-
-# ---------------------------------------------------------------------------
 # Combined reward
 # ---------------------------------------------------------------------------
 
 def compute_combined_reward(
     prediction: str,
     gold_answers: Union[str, List[str]],
-    response_list: List[str],
-    task_type: str = "mmreasoning",
-    f1_weight: float = 0.8,
-    format_weight: float = 0.1,
-    search_weight: float = 0.1,
 ) -> float:
-    """
-    Combined reward = f1_weight * (EM or F1) + format_weight * Format + search_weight * Search
-    For math tasks (AIME-style), use PURE strict exact-match (no format/search bonus).
-    """
+    """Task reward used for training and evaluation (= compute_f1_reward)."""
     # Unified: all tasks use pure token-level F1 on the extracted answer
     return compute_f1_reward(prediction, gold_answers)
 
-
-# ---------------------------------------------------------------------------
-# GRPO advantage computation
-# ---------------------------------------------------------------------------
-
-def compute_grpo_advantages(rewards: List[float]) -> List[float]:
-    """
-    Compute GRPO advantages: normalize rewards within a group.
-    advantage_i = (r_i - mean(r)) / (std(r) + 1e-8)
-    Then apply tanh squashing to keep in [-1, 1].
-    """
-    import numpy as np
-    if not rewards:
-        return []
-    r = np.array(rewards, dtype=np.float64)
-    mean_r = r.mean()
-    std_r = r.std() + 1e-8
-    normalized = (r - mean_r) / std_r
-    return [float(np.tanh(x)) for x in normalized]
-
-
-def compute_grpo_advantages_global(
-    rewards: List[float],
-    global_mean: float,
-    global_std: float,
-) -> List[float]:
-    """
-    Global GRPO advantage: normalize against a running global mean/std.
-    """
-    import numpy as np
-    if not rewards:
-        return []
-    r = np.array(rewards, dtype=np.float64)
-    normalized = (r - global_mean) / (global_std + 1e-8)
-    return [float(np.tanh(x)) for x in normalized]
