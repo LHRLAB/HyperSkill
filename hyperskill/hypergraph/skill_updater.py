@@ -283,7 +283,7 @@ class SkillUpdater:
                     logger.warning("contrastive_extract failed: %s", exc)
 
         await asyncio.gather(*[_process(i, g) for i, g in enumerate(groups)])
-        print(f"  [Extract debug] no_variance={skip_no_var[0]}, "
+        print(f"  [Extract info] no_variance={skip_no_var[0]}, "
               f"no_split={skip_no_split[0]}, empty_extract={empty_extract[0]}")
         # Stash debug counts on self for the caller (lists can't take attrs)
         self._last_no_variance = skip_no_var[0]
