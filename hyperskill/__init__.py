@@ -1,7 +1,6 @@
 """
-HyperSkill: Self-Evolving Omni-Modal Weighted Hypergraph Skill Library
-for Training-Free Group Relative Policy Optimization (GRPO).
+HyperSkill: Training-Free Omnimodal GRPO via Hypergraph-Indexed
+Skill-Library Evolution.
 """
 
 __version__ = "1.0.0"
-__author__ = "HyperSkill Team"

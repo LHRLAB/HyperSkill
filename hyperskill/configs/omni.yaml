@@ -1,31 +1,68 @@
 # HyperSkill — Omni modality config (audio + video + text + image)
 # Datasets: OmniVideoBench, WorldSense
-# runner._build_cfg() loads these on top of the config.py dataclass defaults;
-# in eval mode runner._EVAL_RETRIEVAL then overrides the test_* fields.
+# Merge order (hyperskill/config.py, load_config):
+#   --train: shared sections -> library_runs[<dataset's library_run>]
+#   --eval:  shared sections -> eval -> datasets.<dataset>.eval
 
 llm:
   base_url: https://openrouter.ai/api/v1
   model: google/gemini-3.1-flash-lite-preview
   embedding_model: google/gemini-embedding-2-preview
   embedding_dim: 3072
-  max_tokens: 2048
-  temperature: 1.0       # bumped from 0.7 — diversify rollouts so GRPO has variance
   max_retries: 3
   timeout: 120.0
 
 hypergraph:
-  top_k: 10
-  test_min_similarity: 0.2     # training-time retrieval floor (eval overrides to 0.0)
+  top_k: 3                    # N_max
   skill_dedup_threshold: 1.0
   eta: 0.1
-  beta: 0.01
-  eps: 0.2
   prune_interval: 500
-  prune_min_advantage: -0.5
+  prune_min_advantage: -0.5   # q_min
+  cf_k: 2                     # K counterfactual probes, strict majority
+  rho: 0.5                    # success / failure split
+  rrf_k: 60                   # k_rrf
 
 rollout:
-  n: 4                   # bumped from 2 — more rollouts → more variance for skill extraction
+  n: 2                        # rollouts per question
   max_gen_round: 8
   max_prompt_length: 8096
   max_new_tokens: 1024
   text_search_limit: 2
+
+early_stop:
+  enabled: false
+
+# Library runs (App. "Per-Dataset HyperSkill Configuration"): one epoch over the
+# 128 training questions, batch size 4, n = 2.
+library_runs:
+  R1:
+    llm: {temperature: 1.0}
+    hypergraph: {train_min_similarity: 0.2, hint_synthesis: false, cf_distinct_failures: false}
+    early_stop: {enabled: true}
+  R2:
+    llm: {temperature: 0.4}
+    hypergraph: {train_min_similarity: 0.55, hint_synthesis: true}
+  R3:
+    llm: {temperature: 0.4}
+    hypergraph: {train_min_similarity: 0.2, hint_synthesis: true}
+
+# Evaluation: 1 rollout per question, greedy decoding.
+eval:
+  llm: {temperature: 0.0}
+  hypergraph:
+    test_top_k: 3             # N_max
+    test_min_similarity: 0.55 # tau
+    test_min_advantage: -2.0
+    hint_synthesis: true      # P7
+
+datasets:
+  OmniVideoBench:
+    library_run: R2
+    eval:
+      hypergraph: {test_min_similarity: 0.2}
+  WorldSense:
+    library_run: R1
+    eval:
+      hypergraph:
+        hint_synthesis: false        # terse injection
+        test_min_similarity: 0.2

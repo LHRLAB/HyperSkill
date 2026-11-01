@@ -173,6 +173,26 @@ SKILL_AUGMENTED_PROMPT = """\
 Tip from prior experience: {skills_context}
 """
 
+# P7 -- Strategy Hint Synthesis (paper App. A.3, verbatim)
+SKILL_SUMMARY_PROMPT = """\
+Given a question and a set of retrieved reasoning skills, write a concise
+strategy hint (2-3 sentences) that synthesizes these skills specifically
+for this question. Focus on HOW to combine them, not just listing them.
+Question: {question}
+Retrieved Skills:
+{skills_raw}
+Strategy hint (2-3 sentences, actionable):"""
+
+# Injection variant (ii), schema-constrained hint: output-schema and tool-budget
+# constraints appended to P7 (schema_constrained_hint=True)
+SKILL_SUMMARY_SCHEMA = """
+Constraints for the hint: it must not change the required output format (the agent ends with a short final answer inside <answer>...</answer>, as short as the question allows, never a full sentence when a name, number or phrase suffices).{tool_clause}"""
+SKILL_SUMMARY_SCHEMA_TOOLS = " It must not ask for more than {limit} tool calls in total, and the agent must always finish with a final <answer> even if a search did not find everything."
+
+# Injection variant (iii), tool-neutral hint (tool_neutral_hint=True, tool regimes)
+SKILL_SUMMARY_TOOL_NEUTRAL = """
+The hint must not tell the agent to search, look anything up or use any tool; focus only on how to reason about the given question and input and how to phrase the final answer."""
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -189,9 +209,7 @@ def format_skills_context(skills: list) -> str:
     return " | ".join(lines)
 
 
-def build_initial_prompt(
-    question: str, modality: str, task_type: str, tool_desc: str = ""
-) -> str:
+def build_initial_prompt(question: str, modality: str, tool_desc: str = "") -> str:
     """Build the initial prompt string for a given question and modality."""
     if modality == "omni":
         base = OMNI_AGENT_PROMPT.format(tool_desc=tool_desc)
@@ -205,9 +223,9 @@ def build_initial_prompt(
 def build_skill_augmented_prompt(
     question: str,
     modality: str,
-    task_type: str,
     skills: list,
     tool_desc: str = "",
+    skills_context: str = None,
 ) -> str:
     """Build a skill-augmented initial prompt.
 
@@ -216,7 +234,9 @@ def build_skill_augmented_prompt(
     "(No relevant skills found)" banner is injected, since it adds
     irrelevant tokens that can perturb the model.
     """
-    base = build_initial_prompt(question, modality, task_type, tool_desc=tool_desc)
+    base = build_initial_prompt(question, modality, tool_desc=tool_desc)
+    if skills_context:  # pre-formatted context (P7 hint and/or answer-form line)
+        return SKILL_AUGMENTED_PROMPT.format(skills_context=skills_context) + "\n\n" + base
     if not skills:
         return base
     skill_ctx = format_skills_context(skills)

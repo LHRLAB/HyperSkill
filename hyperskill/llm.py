@@ -3,7 +3,7 @@ LLM and embedding utilities for HyperSkill.
 
 OpenRouter integration for HyperSkill:
   - Sync OpenAI client pointing at https://openrouter.ai/api/v1
-  - API key from api_key_openrouter.txt (project root) or OPENROUTER_API_KEY env var
+  - API key from the OPENROUTER_API_KEY environment variable
   - Generation model : google/gemini-3.1-flash-lite-preview
   - Embedding model  : google/gemini-embedding-2-preview  (dim=3072)
   - Audio/image sent as base64 data URLs via chat completions (no Whisper)
@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -45,14 +46,11 @@ logger = logging.getLogger(__name__)
 # API key resolution
 # ---------------------------------------------------------------------------
 
-def _resolve_api_key(cfg: LLMConfig) -> str:
-    if cfg.api_key:
-        return cfg.api_key
-    # Look for api_key_openrouter.txt in project root (two levels up from this file)
-    key_file = Path(__file__).parent.parent / "api_key_openrouter.txt"
-    if key_file.exists():
-        return key_file.read_text(encoding="utf-8").strip()
-    return os.environ.get("OPENROUTER_API_KEY", "")
+def _resolve_api_key() -> str:
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not set (export OPENROUTER_API_KEY=...)")
+    return api_key
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +60,7 @@ def _resolve_api_key(cfg: LLMConfig) -> str:
 _clients: dict = {}
 
 def _get_client(cfg: LLMConfig) -> OpenAI:
-    key = (cfg.base_url, _resolve_api_key(cfg))
+    key = (cfg.base_url, _resolve_api_key())
     if key not in _clients:
         _clients[key] = OpenAI(
             api_key=key[1],
@@ -78,16 +76,31 @@ def _get_client(cfg: LLMConfig) -> OpenAI:
 # ---------------------------------------------------------------------------
 # Disk cache is essential for reproducibility: two eval runs with the same
 # prompts must return byte-identical responses. Gemini at temperature=0 still
-# exhibits ~1-3% variation across calls without this layer. Disabled by
-# HYPERSKILL_DISABLE_LLM_CACHE=1.
+# exhibits ~1-3% variation across calls without this layer.
 
 _LLM_CACHE_DIR = Path(__file__).resolve().parent.parent / "cache" / "llm"
 _llm_cache: dict = {}
 _MAX_CACHE = 16384
 
 
-def _cache_key(prompt: str, model: str) -> str:
-    return hashlib.sha256(f"{model}::{prompt}".encode()).hexdigest()
+def _cache_key(
+    model: str,
+    system: str,
+    prompt: str,
+    temperature: float,
+    max_tokens: int,
+    media: str = "",
+) -> str:
+    """Key over everything that shapes the response. `temperature` and
+    `max_tokens` are the effective values actually sent; `media` is the
+    image/audio fingerprint of multimodal calls ("" for text-only)."""
+    payload = json.dumps(
+        {"model": model, "system": system, "prompt": prompt,
+         "temperature": float(temperature), "max_tokens": int(max_tokens),
+         "media": media},
+        ensure_ascii=False, sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _disk_path(ck: str) -> Path:
@@ -97,8 +110,6 @@ def _disk_path(ck: str) -> Path:
 
 
 def _cache_get(ck: str) -> Optional[str]:
-    if os.environ.get("HYPERSKILL_DISABLE_LLM_CACHE"):
-        return None
     if ck in _llm_cache:
         return _llm_cache[ck]
     p = _disk_path(ck)
@@ -113,16 +124,89 @@ def _cache_get(ck: str) -> Optional[str]:
 
 
 def _cache_set(ck: str, val: str) -> None:
-    if os.environ.get("HYPERSKILL_DISABLE_LLM_CACHE"):
-        return
     if len(_llm_cache) >= _MAX_CACHE:
         for k in list(_llm_cache.keys())[:_MAX_CACHE // 4]:
             del _llm_cache[k]
     _llm_cache[ck] = val
     try:
-        _disk_path(ck).write_text(val, encoding="utf-8")
+        # Write-then-rename so concurrent readers (parallel dataset
+        # subprocesses share cache/llm) never see a partially written file.
+        p = _disk_path(ck)
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
+        tmp.write_text(val, encoding="utf-8")
+        os.replace(tmp, p)
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Usage / cost accounting (does not affect requests)
+# ---------------------------------------------------------------------------
+# Enabled when HYPERSKILL_COST_FILE is set (hyperskill/runner.py sets it to
+# outputs/<exp_name>/usage_<phase>.json). Every real API call (not cache hits)
+# adds its usage.prompt_tokens / completion_tokens and, when OpenRouter returns
+# it, usage.cost (USD) to an in-process tally keyed by dataset, phase and
+# model. The tally is rewritten (atomically) to HYPERSKILL_COST_FILE after
+# every call; cache hits are counted separately.
+
+import threading
+
+_usage_lock = threading.Lock()
+_usage: dict = {}
+
+
+def _usage_bucket(model: str) -> Optional[dict]:
+    if not os.environ.get("HYPERSKILL_COST_FILE"):
+        return None
+    key = "|".join((
+        os.environ.get("HYPERSKILL_COST_DATASET", ""),
+        os.environ.get("HYPERSKILL_COST_PHASE", ""),
+        model,
+    ))
+    if key not in _usage:
+        dataset, phase, _ = key.split("|", 2)
+        _usage[key] = {
+            "dataset": dataset, "phase": phase, "model": model,
+            "calls": 0, "cache_hits": 0, "calls_without_usage": 0,
+            "prompt_tokens": 0, "completion_tokens": 0,
+            "cost_usd": 0.0, "calls_with_cost": 0,
+        }
+    return _usage[key]
+
+
+def _flush_usage() -> None:
+    path = Path(os.environ["HYPERSKILL_COST_FILE"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(list(_usage.values()), indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _record_usage(model: str, resp=None, cache_hit: bool = False) -> None:
+    try:
+        with _usage_lock:
+            b = _usage_bucket(model)
+            if b is None:
+                return
+            if cache_hit:
+                b["cache_hits"] += 1
+            else:
+                b["calls"] += 1
+                u = getattr(resp, "usage", None)
+                if u is None:
+                    b["calls_without_usage"] += 1
+                else:
+                    b["prompt_tokens"] += int(getattr(u, "prompt_tokens", 0) or 0)
+                    b["completion_tokens"] += int(getattr(u, "completion_tokens", 0) or 0)
+                    cost = getattr(u, "cost", None)
+                    if cost is None and getattr(u, "model_extra", None):
+                        cost = u.model_extra.get("cost")
+                    if cost is not None:
+                        b["cost_usd"] += float(cost)
+                        b["calls_with_cost"] += 1
+            _flush_usage()
+    except Exception as exc:  # accounting must never break a call
+        logger.warning("usage accounting failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -132,16 +216,19 @@ def _cache_set(ck: str, val: str) -> None:
 def sync_llm_call(
     prompt: str,
     cfg: LLMConfig,
+    *,
+    max_tokens: int,
     system: str = "You are a helpful assistant.",
     use_cache: bool = True,
-    max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
 ) -> str:
     """Single-turn text completion via OpenRouter + Gemini."""
-    ck = _cache_key(prompt, cfg.model)
+    temperature = temperature if temperature is not None else cfg.temperature
+    ck = _cache_key(cfg.model, system, prompt, temperature, max_tokens)
     if use_cache:
         hit = _cache_get(ck)
         if hit is not None:
+            _record_usage(cfg.model, cache_hit=True)
             return hit
 
     client = _get_client(cfg)
@@ -151,9 +238,10 @@ def sync_llm_call(
             {"role": "system", "content": system},
             {"role": "user",   "content": prompt},
         ],
-        max_tokens=max_tokens or cfg.max_tokens,
-        temperature=temperature if temperature is not None else cfg.temperature,
+        max_tokens=max_tokens,
+        temperature=temperature,
     )
+    _record_usage(cfg.model, resp)
     text = resp.choices[0].message.content or ""
     if use_cache:
         _cache_set(ck, text)
@@ -168,11 +256,13 @@ def sync_llm_call_with_images(
     prompt: str,
     image_b64_list: List[str],
     cfg: LLMConfig,
+    *,
+    max_tokens: int,
     system: str = "You are a helpful assistant.",
-    max_tokens: Optional[int] = None,
     audio_bytes: Optional[bytes] = None,
     audio_fmt: str = "wav",
     use_cache: bool = True,
+    temperature: Optional[float] = None,
 ) -> str:
     """
     Chat completion with inline images (base64 JPEG/PNG) and optional audio.
@@ -180,14 +270,17 @@ def sync_llm_call_with_images(
     parts, audio via input_audio. Essential for Omni-modal QA (WorldSense)
     where both video frames AND audio are required to answer.
     """
-    # Cache key: hash of prompt + system + image hashes + audio hash.
+    temperature = temperature if temperature is not None else cfg.temperature
+    # Cache key: same fields as the text path plus image/audio fingerprints.
     # This makes vision/audio calls byte-reproducible across eval runs.
-    img_fp = "".join(hashlib.sha256(b.encode()).hexdigest()[:8] for b in image_b64_list)
-    aud_fp = hashlib.sha256(audio_bytes).hexdigest()[:16] if audio_bytes else ""
-    ck = _cache_key(f"{system}\n{prompt}\n[img:{img_fp}][aud:{aud_fp}]", cfg.model)
+    img_fp = ",".join(hashlib.sha256(b.encode()).hexdigest() for b in image_b64_list)
+    aud_fp = f"{audio_fmt}:{hashlib.sha256(audio_bytes).hexdigest()}" if audio_bytes else ""
+    ck = _cache_key(cfg.model, system, prompt, temperature, max_tokens,
+                    media=f"[img:{img_fp}][aud:{aud_fp}]")
     if use_cache:
         hit = _cache_get(ck)
         if hit is not None:
+            _record_usage(cfg.model, cache_hit=True)
             return hit
 
     client = _get_client(cfg)
@@ -214,9 +307,10 @@ def sync_llm_call_with_images(
             {"role": "system", "content": system},
             {"role": "user",   "content": content},
         ],
-        max_tokens=max_tokens or cfg.max_tokens,
-        temperature=cfg.temperature,
+        max_tokens=max_tokens,
+        temperature=temperature,
     )
+    _record_usage(cfg.model, resp)
     text = resp.choices[0].message.content or ""
     if use_cache:
         _cache_set(ck, text)
@@ -248,10 +342,11 @@ def sync_embed_texts(texts: List[str], cfg: LLMConfig) -> np.ndarray:
         for attempt in range(3):
             try:
                 resp = client.embeddings.create(model=cfg.embedding_model, input=batch)
+                _record_usage(cfg.embedding_model, resp)
                 if not resp.data:
                     raise ValueError("No embedding data received")
                 return [d.embedding for d in sorted(resp.data, key=lambda d: d.index)]
-            except Exception as e:
+            except Exception:
                 if attempt < 2:
                     import time; time.sleep(2 ** attempt)
                     continue
@@ -302,9 +397,10 @@ async def _run_in_executor(fn, *args):
 async def async_llm_call(
     prompt: str,
     cfg: LLMConfig,
+    *,
+    max_tokens: int,
     system: str = "You are a helpful assistant.",
     use_cache: bool = True,
-    max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
 ) -> str:
     import functools
@@ -320,16 +416,20 @@ async def async_llm_call_with_images(
     prompt: str,
     image_b64_list: List[str],
     cfg: LLMConfig,
+    *,
+    max_tokens: int,
     system: str = "You are a helpful assistant.",
-    max_tokens: Optional[int] = None,
     audio_bytes: Optional[bytes] = None,
     audio_fmt: str = "wav",
+    use_cache: bool = True,
+    temperature: Optional[float] = None,
 ) -> str:
     import functools
     fn = functools.partial(
         sync_llm_call_with_images, prompt, image_b64_list, cfg,
         system=system, max_tokens=max_tokens,
         audio_bytes=audio_bytes, audio_fmt=audio_fmt,
+        use_cache=use_cache, temperature=temperature,
     )
     return await _run_in_executor(fn)
 

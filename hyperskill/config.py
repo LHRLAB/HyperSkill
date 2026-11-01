@@ -1,13 +1,25 @@
 """
 Configuration dataclasses for HyperSkill.
+
+Every dataset is configured by the YAML of its modality (hyperskill/configs/
+{text,vl,omni}.yaml). A YAML has four kinds of sections:
+
+  llm / hypergraph / rollout / early_stop   shared by training and evaluation
+  library_runs.<R1|R2|R3>                   training settings of a library run
+  eval                                      evaluation defaults
+  datasets.<name>                           the dataset's library run and its
+                                            evaluation overrides
+
+`load_config(yaml_path, dataset, mode)` merges them in this order:
+  train: shared -> library_runs[datasets.<name>.library_run]
+  test:  shared -> eval -> datasets.<name>.eval
 """
 
 from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Dict, Any
 import yaml
-import os
 
 
 # Bundled per-modality YAMLs live next to this file (hyperskill/configs/)
@@ -20,51 +32,75 @@ CONFIGS_DIR = Path(__file__).parent / "configs"
 
 @dataclass
 class LLMConfig:
-    """LLM and embedding model settings (OpenRouter + Gemini)."""
+    """LLM and embedding model settings (OpenRouter). The API key is read from
+    the OPENROUTER_API_KEY environment variable (hyperskill/llm.py)."""
     base_url: str = "https://openrouter.ai/api/v1"
-    api_key: str = ""                            # fallback to api_key_openrouter.txt or env
     model: str = "google/gemini-3.1-flash-lite-preview"
     embedding_model: str = "google/gemini-embedding-2-preview"
     embedding_dim: int = 3072
-    max_tokens: int = 2048
-    temperature: float = 0.7
+    temperature: float = 0.4          # rollout temperature (evaluation: 0)
     max_retries: int = 3
     timeout: float = 60.0
 
 
 @dataclass
 class HypergraphConfig:
-    """Omni-modal weighted hypergraph settings."""
+    """Weighted skill hypergraph: distillation, evolution and gated retrieval."""
     working_dir: str = "expr/skill_library"
-    top_k: int = 10
-    # Retrieval gating. test_top_k / test_min_advantage are only read at eval
-    # time (set by runner._EVAL_RETRIEVAL); test_min_similarity is ALSO the
-    # similarity floor for training-time retrieval (trainer.train_batch).
-    test_top_k: int = 3              # max skills injected during inference
-    test_min_similarity: float = 0.2 # discard hits below this cosine similarity
-    test_min_advantage:  float = 0.0 # require learned advantage ≥ this to inject the skill
-    # Skill deduplication: cosine similarity threshold for near-duplicate suppression.
-    # Set to 1.0 to disable during training (avoids expensive merge LLM calls).
-    skill_dedup_threshold: float = 1.0
-    # Advantage update physics
-    eta: float = 0.1       # driving force coefficient
-    beta: float = 0.01     # KL restoring force coefficient
-    eps: float = 0.2       # clipping range
-    # Pruning
-    prune_interval: int = 500      # prune every N updates
-    prune_min_advantage: float = -0.5  # prune nodes below this weight
+
+    # -- Counterfactually verified step-level distillation (Sec. 3.1) ---------
+    rho: float = 0.5                  # success / failure split of a rollout group
+    cf_k: int = 2                     # K counterfactual probes per candidate on the
+                                      # failed rollouts of its own question; admitted
+                                      # on a strict majority over K_eff = min(K, |O-_q|)
+    cf_distinct_failures: bool = True # False: K votes cycle over the own failures
+                                      # (library run R1: 2 votes on the same failure)
+
+    # -- Retrieval-feedback hypergraph evolution (Sec. 3.2) -------------------
+    eta: float = 0.1                  # EMA step of the node advantage q_i
+    prune_interval: int = 500         # pruning period (every prune_interval // 50 batches)
+    prune_min_advantage: float = -0.5 # q_min: nodes below this advantage are pruned
+    skill_dedup_threshold: float = 1.0  # cosine above which a new skill merges into an old one
+
+    # -- Retrieval (Eq. 6) ----------------------------------------------------
+    top_k: int = 3                    # N_max during training
+    train_min_similarity: float = 0.2 # similarity floor during training
+    rrf_k: int = 60                   # RRF constant k_rrf
+
+    # -- Gated retrieval at evaluation (Sec. 3.3, Eq. 7) ---------------------
+    test_top_k: int = 3               # N_max: capacity gate
+    test_min_similarity: float = 0.55 # tau: similarity floor; below it -> zero-skill fallback
+    test_min_advantage: float = -2.0  # advantage floor (-2 = none; q_i is in [-1, 1])
+
+    # -- Injection (App. A.3 and per-dataset variants) ------------------------
+    # P7 strategy-hint synthesis: when >= 1 skill passes the gates, one LLM
+    # call distils them into a question-aware 2-3 sentence hint; otherwise the
+    # skills are injected as a terse "name: description | ..." list.
+    hint_synthesis: bool = True
+    # (i) hub-corrected similarity s(q, v) - mu_v, mu_v = mean similarity of
+    #     skill v to the training questions, used for ranking and for tau.
+    hub_correction: bool = False
+    # (ii) schema-constrained hint: P7 keeps the output schema (short final
+    #      answer in <answer> tags) and, in tool regimes, the tool budget.
+    schema_constrained_hint: bool = False
+    # (iii) tool-neutral hint: in tool regimes, P7 never tells the agent to search.
+    tool_neutral_hint: bool = False
+    # (iv) answer-form line derived from the gold answers of each skill's 5
+    #      nearest training questions (option letter / short phrase / free form).
+    answer_form_line: bool = False
+    # (v) completion clause: in tool regimes, give the best final answer after
+    #     at most the tool budget.
+    completion_clause: bool = False
 
 
 @dataclass
 class RolloutConfig:
     """Rollout / generation settings."""
-    n: int = 4                       # rollout samples per question
+    n: int = 2                       # rollouts per question during training
     max_gen_round: int = 3           # max agentic rounds per rollout
     max_prompt_length: int = 8096    # word budget
     max_new_tokens: int = 1024
-    image_search_limit: int = 2
-    text_search_limit: int = 3
-    max_search_tokens: int = 1200    # words in a search snippet
+    text_search_limit: int = 2       # tool calls per question
 
 
 @dataclass
@@ -72,9 +108,9 @@ class EarlyStopConfig:
     """Early-stopping criteria for the training loop.
 
     Stops as soon as ANY of the patience-based criteria fires (after
-    `min_batches`). Set `enabled=False` (or all patiences to 0) to disable.
+    `min_batches`). Set `enabled=False` to disable.
     """
-    enabled: bool = True
+    enabled: bool = False
     min_batches: int = 16            # never stop before this many batches
     f1_window: int = 8               # rolling window for F1 plateau check
     f1_min_delta: float = 0.005      # required F1 improvement over the window
@@ -87,13 +123,7 @@ class EarlyStopConfig:
 class DataConfig:
     """Dataset and modality settings."""
     modality: str = "text"           # "text" | "vl" | "omni"
-    hop: str = "single"              # "single" | "multi"
     dataset_names: List[str] = field(default_factory=list)
-    train_path: Optional[str] = None
-    test_path: Optional[str] = None
-    batch_size: int = 4
-    shuffle: bool = True
-    max_samples: Optional[int] = None   # limit dataset size for debugging
 
 
 @dataclass
@@ -105,49 +135,51 @@ class HyperSkillConfig:
     data: DataConfig = field(default_factory=DataConfig)
     early_stop: EarlyStopConfig = field(default_factory=EarlyStopConfig)
 
-    policy_model: str = "google/gemini-3.1-flash-lite-preview"
     mode: str = "train"              # "train" | "test"
+    library_run: str = ""            # R1 | R2 | R3 (see the modality YAML)
     exp_name: str = "hyperskill_exp"
     output_dir: str = "outputs"
-    seed: int = 42
 
 
 # ---------------------------------------------------------------------------
 # Loader
 # ---------------------------------------------------------------------------
 
-def load_config(yaml_path: str) -> "HyperSkillConfig":
-    """
-    Load a YAML config file into a HyperSkillConfig dataclass: defaults plus
-    whatever fields the YAML specifies.
-    """
+_SECTIONS = ("llm", "hypergraph", "rollout", "early_stop")
+
+
+def _overlay(cfg: HyperSkillConfig, block: Dict[str, Any], where: str) -> None:
+    """Set the fields of `block` ({section: {field: value}}) on `cfg`."""
+    for section, values in (block or {}).items():
+        if section not in _SECTIONS:
+            raise ValueError(f"{where}: unknown section '{section}'")
+        sub = getattr(cfg, section)
+        for key, val in (values or {}).items():
+            if not hasattr(sub, key):
+                raise ValueError(f"{where}: unknown field '{section}.{key}'")
+            setattr(sub, key, val)
+
+
+def load_config(yaml_path: str, dataset: str, mode: str) -> HyperSkillConfig:
+    """Build the config of `dataset` for `mode` ("train" | "test")."""
     with open(yaml_path, "r", encoding="utf-8") as f:
         raw: Dict[str, Any] = yaml.safe_load(f) or {}
 
+    ds_cfg = (raw.get("datasets") or {}).get(dataset)
+    if ds_cfg is None:
+        raise ValueError(f"{yaml_path}: no entry for dataset '{dataset}'")
+
     cfg = HyperSkillConfig()
+    cfg.mode = mode
+    _overlay(cfg, {s: raw[s] for s in _SECTIONS if s in raw}, yaml_path)
 
-    # Sub-config sections — overlay only fields present in YAML
-    for section, dc_type, attr in (
-        ("llm",        LLMConfig,        "llm"),
-        ("hypergraph", HypergraphConfig, "hypergraph"),
-        ("rollout",    RolloutConfig,    "rollout"),
-        ("data",       DataConfig,       "data"),
-        ("early_stop", EarlyStopConfig,  "early_stop"),
-    ):
-        if section in raw:
-            sub = getattr(cfg, attr)
-            for key, val in raw[section].items():
-                if hasattr(sub, key):
-                    setattr(sub, key, val)
-
-    # Top-level scalars
-    for key in ("policy_model", "mode", "exp_name",
-                "output_dir", "seed"):
-        if key in raw:
-            setattr(cfg, key, raw[key])
-
-    # API key: YAML > env var
-    if not cfg.llm.api_key:
-        cfg.llm.api_key = os.environ.get("OPENROUTER_API_KEY", "")
-
+    cfg.library_run = ds_cfg["library_run"]
+    if mode == "train":
+        runs = raw.get("library_runs") or {}
+        if cfg.library_run not in runs:
+            raise ValueError(f"{yaml_path}: unknown library run '{cfg.library_run}'")
+        _overlay(cfg, runs[cfg.library_run], f"{yaml_path}: library_runs.{cfg.library_run}")
+    else:
+        _overlay(cfg, raw.get("eval"), f"{yaml_path}: eval")
+        _overlay(cfg, ds_cfg.get("eval"), f"{yaml_path}: datasets.{dataset}.eval")
     return cfg

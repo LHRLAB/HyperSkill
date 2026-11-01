@@ -29,9 +29,7 @@ from ..datasets.loaders import DataBatch
 from ..prompts import build_skill_augmented_prompt
 from ..hypergraph.skill_updater import SkillUpdater
 from ..skill.library import SkillLibrary
-from .rewards import (
-    compute_combined_reward,
-)
+from .rewards import compute_f1_reward
 
 
 def _extract_keyframes(video_path: str, max_frames: int = 3) -> List[str]:
@@ -104,6 +102,113 @@ class HyperSkillGRPOTrainer:
 
         self._llm_cfg = cfg.llm
 
+    async def _skill_context(self, question: str, skills, task_type: str = "") -> Optional[str]:
+        """P7 hint synthesis (App. A.3) when enabled and |S_q| > 0; None
+        means "use the default terse format" (or no injection if no skills)."""
+        if not skills or not self.cfg.hypergraph.hint_synthesis:
+            return None
+        from ..llm import async_llm_call
+        from ..prompts import (SKILL_SUMMARY_PROMPT, SKILL_SUMMARY_SCHEMA,
+                               SKILL_SUMMARY_SCHEMA_TOOLS, SKILL_SUMMARY_TOOL_NEUTRAL)
+        from ..agents.tools import TOOL_PROFILES
+        hcfg = self.cfg.hypergraph
+        has_tools = bool(task_type and TOOL_PROFILES.get(task_type))
+        raw = "\n".join(f"- {getattr(s, 'name', '')}: {getattr(s, 'description', '')}" for s in skills)
+        p7 = SKILL_SUMMARY_PROMPT.format(question=question[:2000], skills_raw=raw)
+        tail = "\nStrategy hint (2-3 sentences, actionable):"
+        if hcfg.tool_neutral_hint and has_tools:
+            p7 = p7.replace(tail, SKILL_SUMMARY_TOOL_NEUTRAL + tail)
+        if hcfg.schema_constrained_hint:
+            clause = SKILL_SUMMARY_SCHEMA_TOOLS.format(limit=self.cfg.rollout.text_search_limit) if has_tools else ""
+            p7 = p7.replace(tail, SKILL_SUMMARY_SCHEMA.format(tool_clause=clause) + tail)
+        try:
+            hint = await async_llm_call(
+                prompt=p7,
+                cfg=self._llm_cfg, use_cache=True, max_tokens=200, temperature=0.0)
+        except Exception as exc:
+            logger.warning("hint synthesis failed: %s", exc)
+            return None
+        hint = " ".join((hint or "").split())
+        return hint or None
+
+    async def _train_split_embeddings(self):
+        """(normalised TRAIN question embeddings, gold word-lengths), cached per trainer."""
+        if getattr(self, "_train_emb", None) is None:
+            from ..datasets.loaders import HyperSkillDataset
+            from ..llm import async_embed_texts
+            ds = self.cfg.data.dataset_names[0]
+            items = list(HyperSkillDataset(ds, "train"))
+            Q = np.asarray(await async_embed_texts([it.question for it in items], self._llm_cfg), dtype=np.float32)
+            Q /= np.linalg.norm(Q, axis=1, keepdims=True) + 1e-8
+            lens = [len(str(it.gold_answers[0]).split()) if it.gold_answers else 1 for it in items]
+            mc = [bool(re.match(r"^\(?[A-J]\)?[.)]?$", str(it.gold_answers[0]).strip())) if it.gold_answers else False
+                  for it in items]
+            self._train_emb = (Q, np.asarray(lens, dtype=np.float32))
+            self._train_mc = np.asarray(mc, dtype=bool)
+        return self._train_emb
+
+    async def _answer_forms(self, k: int = 5) -> None:
+        """Answer-form descriptors of every skill from its k nearest training
+        questions: median gold length (words) and whether their golds are
+        option letters."""
+        vdb = self.skill_library.builder.vdb_skills
+        self._ans_len, self._ans_mc = {}, {}
+        if len(vdb) == 0 or vdb._vecs is None:
+            return
+        Q, lens = await self._train_split_embeddings()
+        S = np.asarray(vdb._vecs, dtype=np.float32)
+        S = S / (np.linalg.norm(S, axis=1, keepdims=True) + 1e-8)
+        sim = S @ Q.T                                    # (skills, train)
+        top = np.argsort(-sim, axis=1)[:, :k]
+        self._ans_mc = {sid: bool(self._train_mc[t].mean() >= 0.5) for sid, t in zip(vdb._ids, top)}
+        self._ans_len = {sid: float(np.median(lens[t])) for sid, t in zip(vdb._ids, top)}
+
+    def _form_line(self, skills, task_type: str) -> str:
+        """Line appended to the injected skills: the completion clause
+        (variant v) or the answer-form line (variant iv)."""
+        from ..agents.tools import TOOL_PROFILES
+        hcfg = self.cfg.hypergraph
+        budget = (f"Use at most {self.cfg.rollout.text_search_limit} searches; "
+                  f"after that, give your best final answer.")
+        if hcfg.completion_clause:
+            if not TOOL_PROFILES.get(task_type):
+                return ""
+            return "Always end with your final answer inside <answer>...</answer>. " + budget
+        if not hcfg.answer_form_line:
+            return ""
+        L = [self._ans_len[s.skill_id] for s in skills if getattr(s, "skill_id", None) in self._ans_len]
+        L = float(np.median(L)) if L else 3.0
+        mc = [self._ans_mc[s.skill_id] for s in skills if getattr(s, "skill_id", None) in self._ans_mc]
+        if task_type == "math":
+            line = ("Answer form: reason step by step but concisely so that the whole response fits in about "
+                    "1,000 tokens, then give the final integer inside <answer>...</answer>.")
+        elif mc and sum(mc) * 2 >= len(mc):
+            line = "Answer form: give the option letter of your choice inside <answer>...</answer> (e.g. <answer>C</answer>)."
+        elif L <= 3:
+            line = (f"Answer form: give only the final answer inside <answer>...</answer> as a short phrase "
+                    f"of at most {int(L) + 2} words, not a full sentence.")
+        else:
+            line = "Answer form: always end with your final answer inside <answer>...</answer>."
+        if TOOL_PROFILES.get(task_type):
+            line += " " + budget
+        return line
+
+    async def _hub_means(self) -> Dict[str, float]:
+        """mu_v = mean cosine of every skill node to the dataset's TRAIN questions."""
+        from ..datasets.loaders import HyperSkillDataset
+        from ..llm import async_embed_texts
+        vdb = self.skill_library.builder.vdb_skills
+        if len(vdb) == 0 or vdb._vecs is None:
+            return {}
+        ds = self.cfg.data.dataset_names[0]
+        qs = [it.question for it in HyperSkillDataset(ds, "train")]
+        Q = np.asarray(await async_embed_texts(qs, self._llm_cfg), dtype=np.float32)
+        Q /= np.linalg.norm(Q, axis=1, keepdims=True) + 1e-8
+        S = np.asarray(vdb._vecs, dtype=np.float32)
+        S = S / (np.linalg.norm(S, axis=1, keepdims=True) + 1e-8)
+        mu = (Q @ S.T).mean(0)
+        return {sid: float(m) for sid, m in zip(vdb._ids, mu)}
+
     # ------------------------------------------------------------------
     # Main training loop
     # ------------------------------------------------------------------
@@ -116,7 +221,6 @@ class HyperSkillGRPOTrainer:
         """
         total_batches = len(dataloader)
         total_f1 = 0.0
-        total_format = 0.0
         batch_count = 0
 
         # ─── Early-stopping bookkeeping ───────────────────────────────────
@@ -134,7 +238,7 @@ class HyperSkillGRPOTrainer:
             metrics = None
             for attempt in range(max_retries):
                 try:
-                    metrics = await self.train_batch(batch, batch_idx)
+                    metrics = await self.train_batch(batch)
                     break
                 except Exception as exc:
                     wait = 2 ** attempt
@@ -149,14 +253,13 @@ class HyperSkillGRPOTrainer:
             elapsed = time.time() - t0
 
             total_f1 += metrics.get("avg_f1", 0.0)
-            total_format += metrics.get("avg_format", 0.0)
             batch_count += 1
 
             metric_label = "Acc" if self.cfg.data.dataset_names and \
                 any(n in ("AIME2024", "AIME2025") for n in self.cfg.data.dataset_names) else "F1"
             print(
                 f"[Batch {batch_idx+1}/{total_batches}] "
-                f"{metric_label}={metrics['avg_f1']:.4f}  Format={metrics['avg_format']:.4f}  "
+                f"{metric_label}={metrics['avg_f1']:.4f}  "
                 f"SkillInserted={metrics.get('skills_inserted', 0)}  "
                 f"Elapsed={elapsed:.1f}s"
             )
@@ -209,15 +312,12 @@ class HyperSkillGRPOTrainer:
 
         return {
             "avg_f1": total_f1 / max(1, batch_count),
-            "avg_format": total_format / max(1, batch_count),
             "batches_run": batch_count,
             "early_stop": stop_reason or "",
             **self.skill_library.stats(),
         }
 
-    async def train_batch(
-        self, batch: List[DataBatch], batch_idx: int
-    ) -> Dict[str, float]:
+    async def train_batch(self, batch: List[DataBatch]) -> Dict[str, float]:
         """
         Process one batch:
           1. Retrieve skills for each question
@@ -228,9 +328,6 @@ class HyperSkillGRPOTrainer:
         n = self.cfg.rollout.n
 
         all_rewards: List[float] = []
-        all_f1: List[float] = []
-        all_format: List[float] = []
-        total_inserted = 0
 
         # For each question, we need N rollouts
         expanded: List[Dict[str, Any]] = []
@@ -249,7 +346,7 @@ class HyperSkillGRPOTrainer:
                 queries=queries,
                 top_k=self.cfg.hypergraph.top_k,
                 image_bytes_list=image_bytes_list,
-                min_similarity=getattr(self.cfg.hypergraph, "test_min_similarity", 0.0),
+                min_similarity=self.cfg.hypergraph.train_min_similarity,
             )
         except Exception as exc:
             logger.warning("Skill retrieval failed: %s — using empty skills", exc)
@@ -258,8 +355,12 @@ class HyperSkillGRPOTrainer:
         # -- Step 2: Build augmented prompts and generate rollouts -------
         from ..agents.tools import build_tools, format_available_tools
 
+        # P7: one hint per question (its n rollouts share the retrieved set)
+        group_ctx = await asyncio.gather(*[
+            self._skill_context(expanded[i].question, skills_per_query[i], expanded[i].task_type)
+            for i in range(0, len(expanded), n)])
         rollout_prompts = []
-        for item, skills in zip(expanded, skills_per_query):
+        for idx_e, (item, skills) in enumerate(zip(expanded, skills_per_query)):
             # Determine available tools for this item and format for prompt
             tools = build_tools(
                 task_type=item.task_type,
@@ -270,9 +371,9 @@ class HyperSkillGRPOTrainer:
             prompt = build_skill_augmented_prompt(
                 question=item.question,
                 modality=self.cfg.data.modality,
-                task_type=item.task_type,
                 skills=skills,
                 tool_desc=tool_desc,
+                skills_context=group_ctx[idx_e // n],
             )
             rollout_prompts.append(prompt)
 
@@ -290,13 +391,12 @@ class HyperSkillGRPOTrainer:
             group_trajs = []
             for roll in group_rollouts:
                 full_response = roll.get("full_response", "")
-                reward = compute_combined_reward(
+                reward = compute_f1_reward(
                     prediction=full_response,
                     gold_answers=gold_answers,
                 )
                 group_rewards.append(reward)
                 group_trajs.append({"text": full_response, "reward": reward})
-                all_f1.append(reward)
 
             all_rewards.extend(group_rewards)
 
@@ -307,26 +407,17 @@ class HyperSkillGRPOTrainer:
                 "trajectories": group_trajs,
             })
 
-        # -- Step 4: CRUD-based skill evolution (TrainingFreeGRPO style) ----
-        # F1 threshold gate: only extract skills when scoring is reliable
-        batch_avg_f1 = float(np.mean(all_f1)) if all_f1 else 0.0
+        # -- Step 4: counterfactually verified step-level distillation -----
         groups_no_var = 0
-        if batch_avg_f1 >= 0.15:
-            try:
-                counts = await self.skill_updater.update(
-                    updater_groups, concurrency=4, num_skills=3,
-                )
-                total_inserted = counts.get("added", 0) + counts.get("updated", 0)
-                groups_no_var = counts.get("groups_no_variance", 0)
-            except Exception as exc:
-                import traceback
-                print(f"  [SkillUpdater FAIL] {type(exc).__name__}: {exc}")
-                traceback.print_exc()
-                total_inserted = 0
-        else:
+        try:
+            counts = await self.skill_updater.update(updater_groups, concurrency=4)
+            total_inserted = counts.get("added", 0)
+            groups_no_var = counts.get("groups_no_variance", 0)
+        except Exception as exc:
+            import traceback
+            print(f"  [SkillUpdater FAIL] {type(exc).__name__}: {exc}")
+            traceback.print_exc()
             total_inserted = 0
-            # Below F1 gate: treat as 'no contrastive signal' for early-stop purposes
-            groups_no_var = len(updater_groups)
 
         # -- Step 5: Retrieval feedback → advantage update + co-occurrence edges
         self._retrieval_advantage_feedback(
@@ -336,23 +427,14 @@ class HyperSkillGRPOTrainer:
         # -- Step 6: Prune low-advantage and stale skills
         builder = self.skill_library.builder
         builder._update_count += 1
-        prune_every = max(1, self.cfg.hypergraph.prune_interval // 50)  # prune more often
+        prune_every = max(1, self.cfg.hypergraph.prune_interval // 50)
         if builder._update_count % prune_every == 0:
             pruned = builder.prune(self.cfg.hypergraph.prune_min_advantage)
             if pruned > 0:
                 print(f"  [Prune] removed {pruned} low-advantage skills")
 
-        # Format score: check all rollouts
-        for roll in rollouts:
-            response_list = roll.get("response_list", [roll.get("full_response", "")])
-            task_type = roll.get("task_type", "mmreasoning")
-            from .rewards import compute_format_reward
-            all_format.append(compute_format_reward(response_list, task_type))
-
         return {
-            "avg_f1": float(np.mean(all_f1)) if all_f1 else 0.0,
-            "avg_format": float(np.mean(all_format)) if all_format else 0.0,
-            "avg_reward": float(np.mean(all_rewards)) if all_rewards else 0.0,
+            "avg_f1": float(np.mean(all_rewards)) if all_rewards else 0.0,
             "skills_inserted": total_inserted,
             "groups_no_variance": groups_no_var,
         }
@@ -377,8 +459,6 @@ class HyperSkillGRPOTrainer:
         """
         from ..hypergraph.skill_updater import make_edge_id
         builder = self.skill_library.builder
-        if builder is None:
-            return
 
         num_questions = len(all_rewards) // n if n > 0 else 0
         if num_questions == 0:
@@ -387,11 +467,10 @@ class HyperSkillGRPOTrainer:
         # Batch-level stats for normalization
         batch_mean = sum(all_rewards) / len(all_rewards)
         batch_var = sum((r - batch_mean) ** 2 for r in all_rewards) / len(all_rewards)
-        batch_std = max(batch_var ** 0.5, 1e-8)
 
         for q_idx in range(num_questions):
             idx = q_idx * n
-            retrieved = skills_per_query[idx] if idx < len(skills_per_query) else []
+            retrieved = skills_per_query[idx]
             if not retrieved:
                 continue
 
@@ -399,8 +478,8 @@ class HyperSkillGRPOTrainer:
             q_rewards = all_rewards[idx: idx + n]
             avg_reward = sum(q_rewards) / len(q_rewards)
 
-            # Normalize to advantage signal ∈ [-1, 1]
-            adv_signal = max(-1.0, min(1.0, (avg_reward - batch_mean) / batch_std))
+            # Eq. (4): advantage signal A = tanh((r - mean) / (std + 1e-8)) in [-1, 1]
+            adv_signal = float(np.tanh((avg_reward - batch_mean) / (batch_var ** 0.5 + 1e-8)))
 
             # EMA update for each retrieved skill
             skill_ids = []
@@ -411,7 +490,7 @@ class HyperSkillGRPOTrainer:
                     skill_ids.append(sid)
 
             # Co-occurrence hyperedge: ≥2 skills + high reward
-            if len(skill_ids) >= 2 and avg_reward >= 0.5:
+            if len(skill_ids) >= 2 and avg_reward >= self.cfg.hypergraph.rho:
                 edge_id = make_edge_id(skill_ids[:5])
                 existing = builder.kv_hyperedges.get(edge_id)
                 if existing:
@@ -469,11 +548,7 @@ class HyperSkillGRPOTrainer:
                     return await self._single_rollout(item, prompt)
                 except Exception as exc:
                     logger.warning("Rollout failed: %s", exc)
-                    return {
-                        "full_response": "",
-                        "response_list": [],
-                        "task_type": item.task_type,
-                    }
+                    return {"full_response": "", "response_list": []}
 
         results = await asyncio.gather(
             *[_generate_one(item, prompt) for item, prompt in zip(items, prompts)]
@@ -537,7 +612,13 @@ class HyperSkillGRPOTrainer:
 
         rollout_system = "You are a helpful assistant."
 
-        for round_idx in range(max_rounds):
+        # Cache only in eval (temp=0 deterministic → identical calls must
+        # return identical responses for reproducibility). In training the N
+        # rollouts of a question share one prompt, so caching would collapse
+        # them into identical samples and remove the GRPO variance.
+        use_cache = (self.cfg.mode == "test")
+
+        for _ in range(max_rounds):
             # Generate next response
             if image_b64_list or audio_bytes_to_send:
                 response = await async_llm_call_with_images(
@@ -548,17 +629,16 @@ class HyperSkillGRPOTrainer:
                     system=rollout_system,
                     audio_bytes=audio_bytes_to_send,
                     audio_fmt=audio_fmt,
+                    use_cache=use_cache,
                 )
                 # Audio is in conversation history now; don't re-send on
                 # subsequent search rounds.
                 audio_bytes_to_send = None
             else:
-                # Enable cache in eval (temp=0 deterministic → identical calls
-                # must return identical responses for reproducibility).
                 response = await async_llm_call(
                     prompt=prompt,
                     cfg=self._llm_cfg,
-                    use_cache=(self.cfg.mode == "test"),
+                    use_cache=use_cache,
                     max_tokens=self.cfg.rollout.max_new_tokens,
                     system=rollout_system,
                 )
@@ -627,37 +707,35 @@ class HyperSkillGRPOTrainer:
                 break  # no tool action → stop
 
         full_response = "\n".join(response_list)
-        return {
-            "full_response": full_response,
-            "response_list": response_list,
-            "task_type": item.task_type,
-        }
+        return {"full_response": full_response, "response_list": response_list}
 
     # ------------------------------------------------------------------
     # Evaluation mode
     # ------------------------------------------------------------------
 
-    async def evaluate(self, dataloader, use_skills: bool = True) -> Dict[str, float]:
-        """Run evaluation without skill library updates.
-
-        Args:
-            use_skills: apply test-time skill retrieval gating
-                        (test_top_k + test_min_similarity).
-        """
+    async def evaluate(self, dataloader) -> Dict[str, float]:
+        """Run evaluation with gated skill retrieval; the library is not updated."""
         all_f1: List[float] = []
+        errors: List[str] = []
+        n_injected: List[int] = []
+        per_question: List[Dict[str, Any]] = []
 
         hcfg = self.cfg.hypergraph
-        eval_top_k = getattr(hcfg, "test_top_k", hcfg.top_k)
-        eval_min_sim = getattr(hcfg, "test_min_similarity", 0.0)
-        eval_min_adv = getattr(hcfg, "test_min_advantage", 0.0)
+        if hcfg.answer_form_line:
+            await self._answer_forms()
+            print(f"  [answer-form] descriptors for {len(self._ans_len)} skills", flush=True)
+        if hcfg.hub_correction:
+            self.skill_library.retriever.hub_mu = await self._hub_means()
+            print(f"  [hub] corrected similarity for {len(self.skill_library.retriever.hub_mu)} skills", flush=True)
 
         eval_sem = asyncio.Semaphore(40)
 
         from ..agents.tools import build_tools, format_available_tools
+        from ..prompts import format_skills_context
 
         async def _eval_one(item, skills):
             async with eval_sem:
-                # Tool stack (SerpAPI/BM25/video-frames/audio) for this item;
+                # Tool stack (knowledge-search/BM25/video-frames/audio) for this item;
                 # the evolving skill library is consulted on top of it.
                 tools = build_tools(
                     task_type=item.task_type,
@@ -665,33 +743,51 @@ class HyperSkillGRPOTrainer:
                     corpus_dir=item.dataset_dir,
                 )
                 tool_desc = format_available_tools(tools)
+                skills_context = None
+                if skills:
+                    skills_context = await self._skill_context(item.question, skills, item.task_type)
+                    line = self._form_line(skills, item.task_type)
+                    if line:
+                        skills_context = (skills_context or format_skills_context(skills)) + "\n" + line
                 prompt = build_skill_augmented_prompt(
                     question=item.question,
                     modality=self.cfg.data.modality,
-                    task_type=item.task_type,
                     skills=skills,
                     tool_desc=tool_desc,
+                    skills_context=skills_context,
                 )
+                rec = {"idx": item._eval_idx,
+                       "question": item.question[:200], "gold": item.gold_answers[:3],
+                       "skills": [getattr(s, "name", "") for s in skills],
+                       "context": (skills_context or "")[:400]}
                 try:
                     rollout = await self._single_rollout(item, prompt)
-                except Exception:
+                except Exception as exc:
+                    # scored 0.0, counted and logged
+                    errors.append(f"{type(exc).__name__}: {str(exc)[:200]}")
+                    logger.warning("eval rollout failed: %s", exc)
+                    rec.update(f1=0.0, error=str(exc)[:200]); per_question.append(rec)
                     return 0.0
-                return compute_combined_reward(
+                f1 = compute_f1_reward(
                     prediction=rollout["full_response"],
                     gold_answers=item.gold_answers,
                 )
+                rec.update(f1=f1, response_tail=rollout["full_response"][-300:],
+                           rounds=len(rollout["response_list"]))
+                per_question.append(rec)
+                return f1
 
+        _k = 0
         for batch in tqdm(dataloader, desc="Evaluating"):
-            if use_skills:
-                queries = [item.question for item in batch]
-                skills_per_query = await self.skill_library.retrieve_for_batch(
-                    queries=queries, top_k=eval_top_k,
-                    min_similarity=eval_min_sim,
-                    min_advantage=eval_min_adv,
-                )
-            else:
-                skills_per_query = [[] for _ in batch]
-
+            for item in batch:
+                item._eval_idx = _k; _k += 1
+            skills_per_query = await self.skill_library.retrieve_for_batch(
+                queries=[item.question for item in batch],
+                top_k=hcfg.test_top_k,
+                min_similarity=hcfg.test_min_similarity,
+                min_advantage=hcfg.test_min_advantage,
+            )
+            n_injected.extend(len(sk) for sk in skills_per_query)
             scores = await asyncio.gather(*[
                 _eval_one(item, sk) for item, sk in zip(batch, skills_per_query)
             ])
@@ -704,11 +800,15 @@ class HyperSkillGRPOTrainer:
 
         return {
             "f1": float(np.mean(all_f1)) if all_f1 else 0.0,
-            "f1_per_question": all_f1,           # for offline re-bootstrap if needed
+            "f1_per_question": all_f1,
             "bootstrap_mean": bootstrap["mean"],
             "bootstrap_std":  bootstrap["std"],
             "n_samples": len(all_f1),
-            "use_skills": use_skills,
+            "n_errors": len(errors),
+            "errors": errors[:20],
+            "skills_injected_per_question": n_injected,
+            "frac_zero_skill": (sum(1 for n in n_injected if n == 0) / len(n_injected)) if n_injected else None,
+            "per_question": sorted(per_question, key=lambda r: r["idx"]),
             **self.skill_library.stats(),
         }
 
@@ -725,7 +825,7 @@ def _bootstrap_mean_std(scores: List[float], frac: float = 0.85,
     Evaluation protocol: 7 random subsamples, each 85% of the test set.
     """
     if not scores:
-        return {"mean": 0.0, "std": 0.0, "subsample_means": []}
+        return {"mean": 0.0, "std": 0.0}
     rng = np.random.default_rng(seed)
     n_total = len(scores)
     k = max(1, int(round(n_total * frac)))
@@ -737,5 +837,4 @@ def _bootstrap_mean_std(scores: List[float], frac: float = 0.85,
     return {
         "mean": float(np.mean(subsample_means)),
         "std":  float(np.std(subsample_means)),
-        "subsample_means": subsample_means,
     }

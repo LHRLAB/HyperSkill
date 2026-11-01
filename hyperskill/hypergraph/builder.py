@@ -5,8 +5,8 @@ skill library.
 Core operations:
   1. _upsert_skills(skills)
      → Embeds verified skills and inserts them into the graph / VDB
-  2. update_advantage(skill_id, new_advantage, configs)
-     → Physics-inspired advantage update with driving force + KL restoring force
+  2. _apply_advantage_update(skill_id, advantage_signal)
+     → EMA update of the node advantage q_i (Eq. 5)
   3. prune(threshold)
      → Remove low-advantage nodes and their edges
 """
@@ -35,12 +35,8 @@ class HypergraphBuilder:
         self.kv_skills = JsonKVStorage(os.path.join(wd, "kv_skills.json"))
         self.kv_hyperedges = JsonKVStorage(os.path.join(wd, "kv_hyperedges.json"))
         self.graph = GraphStorage(os.path.join(wd, "hypergraph.graphml"))
-        self.vdb_skills = VectorStorage(
-            os.path.join(wd, "vdb_skills.json"), dim=llm_cfg.embedding_dim
-        )
-        self.vdb_hyperedges = VectorStorage(
-            os.path.join(wd, "vdb_hyperedges.json"), dim=llm_cfg.embedding_dim
-        )
+        self.vdb_skills = VectorStorage(os.path.join(wd, "vdb_skills.json"))
+        self.vdb_hyperedges = VectorStorage(os.path.join(wd, "vdb_hyperedges.json"))
 
         self._update_count = 0
 
@@ -84,37 +80,15 @@ class HypergraphBuilder:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    async def _upsert_skills(self, raw_skills: List[Dict[str, Any]]) -> int:
+    async def _upsert_skills(self, new_skills: List[Dict[str, Any]]) -> None:
         """
-        Insert/update skills with a two-pass approach:
-
-        Pass 1 — exact-ID check (no API call):
-          Skills whose deterministic ID already exists in kv_skills get an
-          advantage update only — no embedding needed.
-
-        Pass 2 — embed genuinely new skills in one batched API call, then
-          check for semantic near-duplicates and merge if needed.
-          All VDB writes are flushed in a single upsert_batch call.
+        Embed new skills (the caller has checked that their IDs are not in
+        kv_skills) in one batched API call, merge semantic near-duplicates into
+        the existing skill, and flush all VDB writes in a single upsert_batch.
         """
-        if not raw_skills:
-            return 0
-
-        # Split into existing vs new (callers always provide skill_id)
-        exact_existing = [s for s in raw_skills if self.kv_skills.get(s["skill_id"]) is not None]
-        new_skills     = [s for s in raw_skills if self.kv_skills.get(s["skill_id"]) is None]
-
-        # Pass 1: advantage-only update for exact duplicates (no embed)
-        for skill in exact_existing:
-            self._apply_advantage_update(skill["skill_id"], skill["advantage"])
-
-        if not new_skills:
-            return 0
-
-        # Pass 2: embed all genuinely new skills in one batched API call
         descs = [s.get("description", s.get("name", "")) for s in new_skills]
         vecs = await async_embed_texts(descs, self.llm_cfg)
 
-        inserted = 0
         vdb_batch: List[tuple] = []   # (id, vec) collected for single upsert_batch
 
         for skill, vec in zip(new_skills, vecs):
@@ -140,13 +114,10 @@ class HypergraphBuilder:
                 modality=skill.get("modality", "text"),
                 name=skill.get("name", ""),
             )
-            inserted += 1
 
         # Single batch write to VDB — one np.vstack for all new/updated vectors
         if vdb_batch:
             self.vdb_skills.upsert_batch(vdb_batch)
-
-        return inserted
 
     def _apply_advantage_update(self, node_id: str, new_advantage: float) -> None:
         """
@@ -173,7 +144,7 @@ class HypergraphBuilder:
             self.kv_skills.set(node_id, kv_node)
 
     def _compute_new_advantage(
-        self, q_current: float, current_adv: float, q_snapshot: float = 0.0
+        self, q_current: float, current_adv: float
     ) -> float:
         """EMA advantage update (shared helper for hyperedges)."""
         q_new = (1.0 - self.cfg.eta) * q_current + self.cfg.eta * current_adv

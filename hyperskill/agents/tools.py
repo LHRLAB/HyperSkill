@@ -3,13 +3,13 @@ Unified tool registry for HyperSkill agents.
 
 Each dataset category maps to a set of available tools:
   Text-Math  (AIME2024, AIME2025)       → no tools (pure reasoning)
-  Text-Web   (WebWalkerQA)               → text_search (SerpAPI)
-  VL-Web     (FVQA, InfoSeek, ...)       → text_search + image_search (SerpAPI)
+  Text-Web   (WebWalkerQA)               → text_search (Gemini knowledge model)
+  VL-Web     (FVQA, InfoSeek, ...)       → text_search (Gemini knowledge model)
   VL-Doc     (DocBench, MMLongBench-Doc) → doc_search (local corpus VDB)
   Omni       (OmniVideoBench, WorldSense)→ no tools (frames/audio sent to the LLM)
 
 All tools share a unified interface:
-  async def search(query: str, **kwargs) -> str
+  async def search(query: str, ...) -> str
 """
 
 from __future__ import annotations
@@ -29,23 +29,23 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class SearchTool:
-    """Base class for all search tools."""
+    """Base class for all search tools (registered under their XML tag)."""
     name: str = "base"
-    tag: str = "search"  # XML tag in LLM output
 
-    async def search(self, query: str, **kwargs) -> str:
+    async def search(self, query: str) -> str:
         raise NotImplementedError
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SerpAPI on-disk cache
+# Knowledge-search on-disk cache
 #
-# All SerpAPI calls are cached to disk under cache/serpapi/{text,image}/<sha>.txt
-# so repeated training/eval runs hit the cache instead of burning API quota.
-# Set HYPERSKILL_DISABLE_SERPAPI_CACHE=1 to bypass.
+# All knowledge-model search calls are cached under
+# cache/gemini_knowledge/text/<sha256(key)>.txt, where the key covers the
+# knowledge model, its system prompt, num_results and the lowercased query.
+# Empty answers (NO_RESULTS) and errors are not cached.
 # ═══════════════════════════════════════════════════════════════════════════
 
-_CACHE_ROOT = Path(__file__).resolve().parent.parent.parent / "cache" / "serpapi"
+_CACHE_ROOT = Path(__file__).resolve().parent.parent.parent / "cache" / "gemini_knowledge"
 
 
 def _cache_path(kind: str, key: str) -> Path:
@@ -56,8 +56,6 @@ def _cache_path(kind: str, key: str) -> Path:
 
 
 def _cache_get(kind: str, key: str) -> Optional[str]:
-    if os.environ.get("HYPERSKILL_DISABLE_SERPAPI_CACHE"):
-        return None
     p = _cache_path(kind, key)
     if p.exists():
         try:
@@ -68,77 +66,46 @@ def _cache_get(kind: str, key: str) -> Optional[str]:
 
 
 def _cache_put(kind: str, key: str, value: str) -> None:
-    if os.environ.get("HYPERSKILL_DISABLE_SERPAPI_CACHE"):
-        return
     try:
-        _cache_path(kind, key).write_text(value, encoding="utf-8")
+        # Write-then-rename: parallel dataset subprocesses share this cache.
+        p = _cache_path(kind, key)
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
+        tmp.write_text(value, encoding="utf-8")
+        os.replace(tmp, p)
     except OSError as exc:
-        logger.warning("serpapi cache write failed: %s", exc)
+        logger.warning("search cache write failed: %s", exc)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SerpAPI text search
+# Text search (Gemini knowledge model)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TextSearchTool(SearchTool):
-    """Web text search via SerpAPI (with disk cache)."""
+    """Text search served by the Gemini knowledge model (with disk cache)."""
     name = "text_search"
-    tag = "text_search"
 
-    def __init__(self, api_key: str = ""):
-        from ..search import _resolve_serpapi_key
-        self.api_key = api_key or _resolve_serpapi_key()
+    num_results = 5
 
-    async def search(self, query: str, **kwargs) -> str:
-        cache_key = query.strip().lower()
+    async def search(self, query: str) -> str:
+        from ..search import KNOWLEDGE_MODEL, KNOWLEDGE_SYSTEM, NO_RESULTS, knowledge_search
+        cache_key = json.dumps(
+            {"model": KNOWLEDGE_MODEL, "system": KNOWLEDGE_SYSTEM,
+             "num_results": self.num_results, "query": query.strip().lower()},
+            ensure_ascii=False, sort_keys=True,
+        )
         cached = _cache_get("text", cache_key)
         if cached is not None:
             return cached
 
-        if not self.api_key:
-            return f"(SerpAPI key not configured — no results for: {query})"
-        from ..search import serpapi_search
         try:
-            result = await serpapi_search(query, self.api_key, num_results=5)
+            result = await knowledge_search(query, num_results=self.num_results)
         except Exception as exc:
             logger.warning("text_search failed: %s", exc)
             return f"(Search error: {exc})"
-        _cache_put("text", cache_key, result)
-        return result
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SerpAPI image search (Google Images text query)
-# ═══════════════════════════════════════════════════════════════════════════
-
-class ImageSearchTool(SearchTool):
-    """Image search via SerpAPI (Google Images, with disk cache)."""
-    name = "image_search"
-    tag = "image_search"
-
-    def __init__(self, api_key: str = ""):
-        from ..search import _resolve_serpapi_key
-        self.api_key = api_key or _resolve_serpapi_key()
-
-    async def search(self, query: str, **kwargs) -> str:
-        # Trailing "|" kept from the former "<query>|<image_url>" key format
-        # so existing cache/serpapi/image entries stay valid.
-        cache_key = f"{query.strip().lower()}|"
-        cached = _cache_get("image", cache_key)
-        if cached is not None:
-            return cached
-
-        if not self.api_key:
-            return "(SerpAPI key not configured)"
-        from ..search import serpapi_image_search
-        try:
-            result = await serpapi_image_search(
-                query=query, api_key=self.api_key, num_results=5,
-            )
-        except Exception as exc:
-            logger.warning("image_search failed: %s", exc)
-            return f"(Image search error: {exc})"
-        _cache_put("image", cache_key, result)
+        # An empty completion (e.g. max_tokens spent on reasoning, filtered
+        # output) is indistinguishable from "no knowledge" here; don't pin it.
+        if result != NO_RESULTS:
+            _cache_put("text", cache_key, result)
         return result
 
 
@@ -149,7 +116,6 @@ class ImageSearchTool(SearchTool):
 class DocSearchTool(SearchTool):
     """BM25 search over a local document corpus (PDF pages → chunks)."""
     name = "doc_search"
-    tag = "doc_search"
 
     def __init__(self, corpus_dir: str):
         self.corpus_dir = Path(corpus_dir)
@@ -203,7 +169,7 @@ class DocSearchTool(SearchTool):
             print(f"  [DocSearch] Indexed {len(chunks)} chunks")
 
     async def search(self, query: str, top_k: int = 5,
-                     restrict_to: Optional[List[str]] = None, **kwargs) -> str:
+                     restrict_to: Optional[List[str]] = None) -> str:
         """
         Args:
             restrict_to: list of PDF stems (e.g. ["STEPBACK"]) — when given,
@@ -242,7 +208,7 @@ class DocSearchTool(SearchTool):
 TOOL_PROFILES = {
     "math":        [],                                # pure reasoning
     "webagent":    ["text_search"],                    # WebWalkerQA
-    "websearch":   ["text_search", "image_search"],    # VL-Web datasets
+    "websearch":   ["text_search"],                    # VL-Web datasets
     "mmreasoning": [],                                 # default fallback
     "docsearch":   ["doc_search"],                     # VL-Doc datasets
 }
@@ -273,8 +239,6 @@ def build_tools(
     for name in tool_names:
         if name == "text_search":
             tools["text_search"] = TextSearchTool()
-        elif name == "image_search":
-            tools["image_search"] = ImageSearchTool()
         elif name == "doc_search":
             tools["doc_search"] = DocSearchTool(corpus_dir)
 
@@ -288,7 +252,6 @@ def format_available_tools(tools: Dict[str, SearchTool]) -> str:
         return ""
     descs = {
         "text_search":  "Text search: <text_search>your query</text_search>",
-        "image_search": "Image search: <image_search>describe what to find</image_search>",
         "doc_search":   "Document search: <doc_search>your query</doc_search>",
     }
     lines = ["\nAvailable tools:"]
@@ -352,8 +315,8 @@ def _bm25_search(
 def _extract_pdf_text(pdf_path: Path) -> List[str]:
     """Extract text from each page of a PDF."""
     try:
-        import fitz  # PyMuPDF
-        doc = fitz.open(str(pdf_path))
+        import pymupdf  # PyMuPDF
+        doc = pymupdf.open(str(pdf_path))
         pages = [page.get_text() for page in doc]
         doc.close()
         return pages

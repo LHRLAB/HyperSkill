@@ -1,87 +1,32 @@
 """
-Web search via SerpAPI for HyperSkill websearch tasks.
-
-API key is read from api_key_serpapi.txt in the project root,
-or from the SERPAPI_KEY environment variable.
+Web search for HyperSkill websearch tasks, served by a Gemini knowledge model
+via OpenRouter (the same client and key as the backbone LLM).
 """
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
+from dataclasses import replace
+
+KNOWLEDGE_MODEL = "google/gemini-3.8-flash"
+NO_RESULTS = "(No search results found)"
+KNOWLEDGE_SYSTEM = (
+    "You are a knowledge source standing in for a web search engine. "
+    "Given a search query, return up to {n} concise, factual snippets relevant to it. "
+    "Format each snippet as '**<short title>**' on one line followed by 1-3 sentences of fact. "
+    "Separate snippets with a blank line. Do not speculate; if you have no relevant "
+    "knowledge, reply exactly '(No search results found)'."
+)
 
 
-def _resolve_serpapi_key() -> str:
-    key_file = Path(__file__).parent.parent / "api_key_serpapi.txt"
-    if key_file.exists():
-        return key_file.read_text(encoding="utf-8").strip()
-    return os.environ.get("SERPAPI_KEY", "")
+async def knowledge_search(query: str, num_results: int = 5) -> str:
+    """Return search-style knowledge snippets for `query` from the Gemini knowledge model."""
+    from .config import LLMConfig
+    from .llm import async_llm_call
 
-
-async def serpapi_search(
-    query: str,
-    api_key: str,
-    num_results: int = 5,
-) -> str:
-    """
-    Search via SerpAPI and return a formatted results string.
-
-    Returns a multi-line string with title, snippet, and URL for each result.
-    Raises httpx.HTTPError on network/API failure (caller should catch).
-    """
-    import httpx
-
-    params = {
-        "q": query,
-        "api_key": api_key,
-        "num": num_results,
-        "engine": "google",
-    }
-    async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
-        resp = await client.get("https://serpapi.com/search.json", params=params)
-        resp.raise_for_status()
-        data = resp.json()
-
-    results = data.get("organic_results", [])
-    if not results:
-        return "(No search results found)"
-
-    lines = []
-    for r in results[:num_results]:
-        title   = r.get("title", "")
-        snippet = r.get("snippet", "")
-        link    = r.get("link", "")
-        lines.append(f"**{title}**\n{snippet}\n{link}")
-    return "\n\n".join(lines)
-
-
-async def serpapi_image_search(
-    query: str,
-    api_key: str,
-    num_results: int = 5,
-) -> str:
-    """Image search via SerpAPI (Google Images text-based image search)."""
-    import httpx
-
-    params = {
-        "engine": "google_images",
-        "q": query,
-        "api_key": api_key,
-        "num": num_results,
-    }
-
-    async with httpx.AsyncClient(timeout=15.0, verify=False) as client:
-        resp = await client.get("https://serpapi.com/search.json", params=params)
-        resp.raise_for_status()
-        data = resp.json()
-
-    results = data.get("images_results", [])
-    if not results:
-        return "(No image results found)"
-    lines = []
-    for r in results[:num_results]:
-        title = r.get("title", "")
-        snippet = r.get("snippet", "")
-        source = r.get("source", "")
-        lines.append(f"**{title}**\n{snippet}\n{source}")
-    return "\n\n".join(lines)
+    cfg = replace(LLMConfig(), model=KNOWLEDGE_MODEL)
+    text = await async_llm_call(
+        f"Search query: {query}", cfg,
+        system=KNOWLEDGE_SYSTEM.format(n=num_results),
+        use_cache=False, max_tokens=512, temperature=0.0,
+    )
+    return text.strip() or NO_RESULTS

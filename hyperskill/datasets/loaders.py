@@ -8,6 +8,8 @@ Dataset folder layout (see DATASET_KEYS for each <group>/<name>):
     test.jsonl       data_source, images / video / audio (relative paths)
     resources/       images / PDFs / videos / audio referenced above
 
+train.jsonl (128 questions per dataset) and test.jsonl are used as is.
+
 Datasets
 ────────
   Text
@@ -57,7 +59,6 @@ DATASET_KEYS: Dict[str, Dict[str, str]] = {
 
 DATASET_ROOT = Path(__file__).parent.parent.parent / "dataset"
 
-
 # ---------------------------------------------------------------------------
 # Data container
 # ---------------------------------------------------------------------------
@@ -69,7 +70,6 @@ class DataBatch:
     gold_answers:  List[str]
     source:        str               # dataset name (e.g. "FVQA")
     task_type:     str               # e.g. "websearch", "math", "mmreasoning", "docsearch"
-    modality:      str               # "text", "vl", "omni"
     resource_type: str = "none"      # "none" | "image" | "pdf" | "video" | "video_audio"
     # resolved file bytes loaded from resource_paths
     images:        List[bytes]       = field(default_factory=list)
@@ -97,21 +97,14 @@ class HyperSkillDataset:
     VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
     AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
 
-    def __init__(
-        self,
-        dataset_name: str,
-        split: str = "train",
-        max_samples: Optional[int] = None,
-        dataset_root: Optional[Path] = None,
-    ):
+    def __init__(self, dataset_name: str, split: str = "train"):
         import json as _json
-        root = Path(dataset_root) if dataset_root else DATASET_ROOT
         info = DATASET_KEYS.get(dataset_name)
         if info is None:
             raise ValueError(f"Unknown dataset: {dataset_name}. "
                              f"Available: {sorted(DATASET_KEYS)}")
 
-        self._folder = root / info["folder"]
+        self._folder = DATASET_ROOT / info["folder"]
         jsonl_path   = self._folder / f"{split}.jsonl"
         if not jsonl_path.exists():
             raise FileNotFoundError(
@@ -127,9 +120,6 @@ class HyperSkillDataset:
                         records.append(_json.loads(line))
         except Exception as e:
             raise RuntimeError(f"Failed to load {jsonl_path}: {e}")
-
-        if max_samples is not None:
-            records = records[:max_samples]
 
         self._records = records
         self._info    = info
@@ -152,10 +142,9 @@ class HyperSkillDataset:
             gold_answers = []
 
         source = str(row.get("data_source", "unknown"))
-        # task_type / modality / resource_type: DATASET_KEYS is canonical
-        # (older JSONLs may carry stale "mmreasoning" task_type — ignore those)
+        # task_type / resource_type: DATASET_KEYS is canonical
+        # (task_type stored in a JSONL row is ignored)
         task_type     = self._info["task_type"]
-        modality      = self._info["modality"]
         resource_type = self._info.get("resource_type", "none")
 
         images:     List[bytes] = []
@@ -210,7 +199,6 @@ class HyperSkillDataset:
             gold_answers=gold_answers,
             source=source,
             task_type=task_type,
-            modality=modality,
             resource_type=resource_type,
             images=images,
             audio=audio,

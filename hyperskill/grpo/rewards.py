@@ -1,16 +1,13 @@
 """
-Reward functions for Training-Free GRPO in HyperSkill.
-
-Two reward signals:
-  1. F1 reward       — token-level F1 between predicted and ground-truth answers
-  2. Format reward   — structural validity of the response format (logged only)
+Reward for Training-Free GRPO in HyperSkill: answer-shape-aware token-level F1
+between the predicted and ground-truth answers (training and evaluation).
 """
 
 from __future__ import annotations
 import re
 import string
 from collections import Counter
-from typing import List, Optional, Union
+from typing import List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -113,10 +110,7 @@ def _entity_containment(pred: str, gold: str) -> float:
     return token_f1(pred, gold)
 
 
-def compute_f1_reward(
-    prediction: str,
-    gold_answers: Union[str, List[str]],
-) -> float:
+def compute_f1_reward(prediction: str, gold_answers: List[str]) -> float:
     """
     Answer-shape-aware F1 reward:
       1. If gold is MC (letter) → strict letter match (0.0 / 1.0).
@@ -126,9 +120,6 @@ def compute_f1_reward(
 
     Returns max score over all gold alternatives.
     """
-    if isinstance(gold_answers, str):
-        gold_answers = [gold_answers]
-
     # Extract predicted answer from <answer>...</answer> tag
     answer_match = re.findall(r"<answer>(.*?)</answer>", prediction, re.DOTALL)
     if answer_match:
@@ -147,153 +138,3 @@ def compute_f1_reward(
 
     # -- 2/3. Entity containment / token F1 ------------------------------
     return max(_entity_containment(pred_text, g) for g in gold_answers)
-
-
-# ---------------------------------------------------------------------------
-# Format rewards
-# ---------------------------------------------------------------------------
-
-# Allowed response patterns (regex)
-_DIRECT_ANSWER_RE = re.compile(
-    r"^<reason>.*?</reason>.*?<answer>.*?</answer>$", re.DOTALL
-)
-_TEXT_SEARCH_RE = re.compile(
-    r"^<reason>.*?</reason>.*?<text_search>.*?</text_search>$", re.DOTALL
-)
-_IMAGE_SEARCH_RE = re.compile(
-    r"^<reason>.*?</reason>.*?<search><img></search>$", re.DOTALL
-)
-_DOC_SEARCH_RE = re.compile(
-    r"^<reason>.*?</reason>.*?<doc_search>.*?</doc_search>$", re.DOTALL
-)
-_MEDIA_SEARCH_RE = re.compile(
-    r"^<reason>.*?</reason>.*?<media_search>.*?</media_search>$", re.DOTALL
-)
-
-
-def _is_valid_doc_search(response: str) -> bool:
-    if not _DOC_SEARCH_RE.match(response):
-        return False
-    if response.count("<reason>") != 1 or response.count("</reason>") != 1:
-        return False
-    if response.count("<doc_search>") != 1 or response.count("</doc_search>") != 1:
-        return False
-    if "<answer>" in response or "</answer>" in response:
-        return False
-    return True
-
-
-def _is_valid_media_search(response: str) -> bool:
-    if not _MEDIA_SEARCH_RE.match(response):
-        return False
-    if response.count("<reason>") != 1 or response.count("</reason>") != 1:
-        return False
-    if response.count("<media_search>") != 1 or response.count("</media_search>") != 1:
-        return False
-    if "<answer>" in response or "</answer>" in response:
-        return False
-    return True
-
-
-def _is_valid_direct_answer(response: str) -> bool:
-    if not _DIRECT_ANSWER_RE.match(response):
-        return False
-    if response.count("<reason>") != 1 or response.count("</reason>") != 1:
-        return False
-    if response.count("<answer>") != 1 or response.count("</answer>") != 1:
-        return False
-    if "<search><img></search>" in response:
-        return False
-    if "<text_search>" in response or "</text_search>" in response:
-        return False
-    return True
-
-
-def _is_valid_text_search(response: str) -> bool:
-    if not _TEXT_SEARCH_RE.match(response):
-        return False
-    if response.count("<reason>") != 1 or response.count("</reason>") != 1:
-        return False
-    if response.count("<text_search>") != 1 or response.count("</text_search>") != 1:
-        return False
-    if "<answer>" in response or "</answer>" in response:
-        return False
-    if "<search><img></search>" in response:
-        return False
-    return True
-
-
-def _is_valid_image_search(response: str) -> bool:
-    if not _IMAGE_SEARCH_RE.match(response):
-        return False
-    if response.count("<reason>") != 1 or response.count("</reason>") != 1:
-        return False
-    if response.count("<search><img></search>") != 1:
-        return False
-    if "<answer>" in response or "</answer>" in response:
-        return False
-    if "<text_search>" in response or "</text_search>" in response:
-        return False
-    return True
-
-
-def compute_format_reward(
-    response_list: List[str],
-    task_type: str = "mmreasoning",
-) -> float:
-    """
-    Check if a multi-turn response trajectory follows valid formats throughout.
-
-    For mmreasoning: only direct answers allowed.
-    For websearch: search actions + final direct answer allowed.
-
-    Returns a score in {0.0, 0.5, 1.0}.
-    """
-    if not response_list:
-        return 0.0
-
-    # For reasoning tasks: every intermediate step must be direct answer
-    if task_type == "mmreasoning":
-        # All intermediate + final responses should be direct answers
-        for resp in response_list:
-            resp = resp.strip()
-            if not _is_valid_direct_answer(resp):
-                # Partial credit: at least has the right tags
-                if "<reason>" in resp and "<answer>" in resp:
-                    return 0.5
-                return 0.0
-        return 1.0
-
-    # For search tasks: intermediates can be searches, last must be direct answer
-    for i, resp in enumerate(response_list):
-        resp = resp.strip()
-        is_last = (i == len(response_list) - 1)
-        if is_last:
-            if not _is_valid_direct_answer(resp):
-                if "<reason>" in resp and "<answer>" in resp:
-                    return 0.5
-                return 0.0
-        else:
-            if not (_is_valid_text_search(resp)
-                    or _is_valid_image_search(resp)
-                    or _is_valid_doc_search(resp)
-                    or _is_valid_media_search(resp)
-                    or _is_valid_direct_answer(resp)):
-                if "<reason>" in resp:
-                    return 0.5
-                return 0.0
-    return 1.0
-
-
-# ---------------------------------------------------------------------------
-# Combined reward
-# ---------------------------------------------------------------------------
-
-def compute_combined_reward(
-    prediction: str,
-    gold_answers: Union[str, List[str]],
-) -> float:
-    """Task reward used for training and evaluation (= compute_f1_reward)."""
-    # Unified: all tasks use pure token-level F1 on the extracted answer
-    return compute_f1_reward(prediction, gold_answers)
-

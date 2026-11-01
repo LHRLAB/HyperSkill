@@ -96,13 +96,18 @@ class HypergraphRetriever:
         # surface after advantage filtering + RRF re-ranking.
         pool_k = max(top_k * 20, 100)
         skill_hits = self.vdb_skills.query(query_vec, top_k=pool_k)
+        # Hub-corrected similarity s - mu_v (variant i; set by trainer.evaluate)
+        hub_mu = getattr(self, "hub_mu", None)
+        if hub_mu:
+            skill_hits = sorted(((sid, sim - hub_mu.get(sid, 0.0)) for sid, sim in skill_hits),
+                                key=lambda x: -x[1])
 
         # -- 3. Search hyperedge VDB then expand ---------------------------
         edge_hits = self.vdb_hyperedges.query(query_vec, top_k=top_k)
         min_sim = min_similarity if min_similarity is not None else 0.0
         extra_hits: list = []
         for edge_id, edge_sim in edge_hits:
-            if edge_sim < min_sim:          # 超边本身不相关，跳过
+            if edge_sim < min_sim:          # hyperedge itself is not relevant
                 continue
             edge_data = self.kv_hyperedges.get(edge_id, {})
             for nid in edge_data.get("node_ids", []):
@@ -126,7 +131,7 @@ class HypergraphRetriever:
             filtered.append((skill_id, sim, skill_data))
 
         # -- 5. Advantage-weighted RRF re-ranking --------------------------
-        results = self._rrf_rank(filtered, top_k)
+        results = self._rrf_rank(filtered, top_k, rrf_k=int(self.cfg.rrf_k))
         return results
 
     async def retrieve_for_batch(

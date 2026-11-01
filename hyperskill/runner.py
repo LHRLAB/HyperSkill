@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import shutil
 import time
 from pathlib import Path
@@ -24,7 +25,6 @@ from .datasets.loaders import (
     HyperSkillDataset,
     HyperSkillDataLoader,
     DATASET_KEYS,
-    DATASET_ROOT,
 )
 from .grpo.trainer import HyperSkillGRPOTrainer
 
@@ -35,15 +35,19 @@ _MODALITY_YAML = {
     "omni": CONFIGS_DIR / "omni.yaml",
 }
 
-# Eval-time retrieval gating, applied to every dataset in test mode. Overrides
-# the test_* fields of HypergraphConfig on top of the modality YAML.
-_EVAL_RETRIEVAL = {
-    "test_top_k": 5,
-    "test_min_similarity": 0.0,
-    "test_min_advantage": -2.0,
-}
+EPOCHS = 1
+BATCH_SIZE = 4
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _enable_cost_log(cfg: HyperSkillConfig, ds_name: str, phase: str) -> None:
+    """Per-(dataset, phase) token usage / cost log written by hyperskill/llm.py
+    to outputs/<exp_name>/usage_<phase>.json."""
+    f = PROJECT_ROOT / cfg.output_dir / cfg.exp_name / f"usage_{phase}.json"
+    os.environ["HYPERSKILL_COST_FILE"] = str(f)
+    os.environ["HYPERSKILL_COST_DATASET"] = ds_name
+    os.environ["HYPERSKILL_COST_PHASE"] = phase
 
 
 def _build_cfg(ds_name: str, mode: str) -> HyperSkillConfig:
@@ -51,30 +55,11 @@ def _build_cfg(ds_name: str, mode: str) -> HyperSkillConfig:
     if info is None:
         raise ValueError(f"Unknown dataset '{ds_name}'. Known: {sorted(DATASET_KEYS)}")
 
-    yaml_path = _MODALITY_YAML.get(info["modality"])
-    cfg = load_config(str(yaml_path)) if yaml_path and yaml_path.exists() else HyperSkillConfig()
-
+    cfg = load_config(str(_MODALITY_YAML[info["modality"]]), ds_name, mode)
     cfg.data.modality        = info["modality"]
     cfg.data.dataset_names   = [ds_name]
     cfg.hypergraph.working_dir = str(PROJECT_ROOT / "expr" / "skill_library" / ds_name)
     cfg.exp_name             = f"hyperskill_{ds_name.lower()}"
-    cfg.mode                 = mode
-
-    # Reproducibility: temperature=0 (deterministic decoding) + fixed seed 42
-    # for any stochastic step (bootstrap, shuffling, etc.). The skill library
-    # itself is persisted to disk (expr/skill_library/<dataset>/) so eval runs
-    # are fully determined by (library_state, test_set, eval config).
-    if mode == "test":
-        cfg.llm.temperature = 0.0
-        cfg.seed = 42
-        for key, val in _EVAL_RETRIEVAL.items():
-            if hasattr(cfg.hypergraph, key):
-                setattr(cfg.hypergraph, key, val)
-
-    key_file = PROJECT_ROOT / "api_key_openrouter.txt"
-    if key_file.exists():
-        cfg.llm.api_key = key_file.read_text(encoding="utf-8").strip()
-
     return cfg
 
 
@@ -82,34 +67,29 @@ def _build_cfg(ds_name: str, mode: str) -> HyperSkillConfig:
 # Train
 # ---------------------------------------------------------------------------
 
-async def train_one(
-    ds_name: str,
-    epochs: int = 1,
-    resume: bool = False,
-    max_samples: int | None = None,
-    batch_size: int = 4,
-) -> dict:
+async def train_one(ds_name: str) -> dict:
     cfg = _build_cfg(ds_name, mode="train")
+    _enable_cost_log(cfg, ds_name, "train")
 
     wd = Path(cfg.hypergraph.working_dir)
-    if not resume and wd.exists():
+    if wd.exists():
         shutil.rmtree(wd)
         print(f"[{ds_name}] Reset: removed {wd}", flush=True)
 
-    print(f"[{ds_name}] Train · modality={cfg.data.modality} · epochs={epochs}", flush=True)
-    dataset = HyperSkillDataset(ds_name, split="train",
-                                max_samples=max_samples, dataset_root=DATASET_ROOT)
-    loader  = HyperSkillDataLoader(dataset, batch_size=batch_size, shuffle=True)
+    print(f"[{ds_name}] Train · modality={cfg.data.modality} · "
+          f"library run {cfg.library_run} · epochs={EPOCHS}", flush=True)
+    dataset = HyperSkillDataset(ds_name, split="train")
+    loader  = HyperSkillDataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
     print(f"[{ds_name}] {len(dataset)} samples · {len(loader)} batches/epoch", flush=True)
 
     trainer = HyperSkillGRPOTrainer(cfg)
     last_metrics: dict = {}
-    for epoch in range(1, epochs + 1):
+    for epoch in range(1, EPOCHS + 1):
         t0 = time.time()
         metrics = await trainer.train(loader)
         elapsed = time.time() - t0
         trainer.skill_library.save()
-        print(f"[{ds_name}] Epoch {epoch}/{epochs}: F1={metrics.get('avg_f1', 0):.4f} "
+        print(f"[{ds_name}] Epoch {epoch}/{EPOCHS}: F1={metrics.get('avg_f1', 0):.4f} "
               f"skills={metrics.get('skill_nodes', 0)} elapsed={elapsed:.1f}s", flush=True)
         last_metrics = metrics
 
@@ -124,19 +104,13 @@ async def train_one(
 # Evaluate
 # ---------------------------------------------------------------------------
 
-async def evaluate_one(
-    ds_name: str,
-    split: str = "test",
-    max_samples: int | None = None,
-    batch_size: int = 4,
-) -> dict:
+async def evaluate_one(ds_name: str) -> dict:
     cfg = _build_cfg(ds_name, mode="test")
+    _enable_cost_log(cfg, ds_name, "eval")
 
-    tag = "HyperSkill"
-    print(f"[{ds_name}] {tag} · modality={cfg.data.modality} · split={split}", flush=True)
-    dataset = HyperSkillDataset(ds_name, split=split,
-                                max_samples=max_samples, dataset_root=DATASET_ROOT)
-    loader  = HyperSkillDataLoader(dataset, batch_size=batch_size, shuffle=False)
+    print(f"[{ds_name}] HyperSkill · modality={cfg.data.modality} · split=test", flush=True)
+    dataset = HyperSkillDataset(ds_name, split="test")
+    loader  = HyperSkillDataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
     print(f"[{ds_name}] {len(dataset)} samples", flush=True)
 
     trainer = HyperSkillGRPOTrainer(cfg)
@@ -146,14 +120,11 @@ async def evaluate_one(
 
     out_dir = PROJECT_ROOT / cfg.output_dir / cfg.exp_name
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = "eval_results.json"
-    (out_dir / out_file).write_text(json.dumps(metrics, indent=2))
+    (out_dir / "eval_results.json").write_text(json.dumps(metrics, indent=2))
 
-    bm = metrics.get("bootstrap_mean", metrics.get("f1", 0))
-    bs = metrics.get("bootstrap_std", 0.0)
-    print(f"[{ds_name}] {tag} F1={metrics.get('f1', 0):.4f} "
-          f"boot={bm:.4f}±{bs:.4f} (n={metrics.get('n_samples', 0)}, "
-          f"7×85%)", flush=True)
+    print(f"[{ds_name}] HyperSkill F1={metrics.get('f1', 0):.4f} "
+          f"(n={metrics.get('n_samples', 0)}; bootstrap 7×85% "
+          f"{metrics.get('bootstrap_mean', 0):.4f}±{metrics.get('bootstrap_std', 0):.4f})", flush=True)
     return metrics
 
 
@@ -164,23 +135,15 @@ async def evaluate_one(
 def _main():
     p = argparse.ArgumentParser(description="HyperSkill single-dataset worker")
     mode = p.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--train",      action="store_true")
-    mode.add_argument("--eval",       action="store_true")
-    p.add_argument("--dataset",     required=True, help="Dataset key, e.g. AIME2024")
-    p.add_argument("--epochs",      type=int, default=1)
-    p.add_argument("--resume",      action="store_true")
-    p.add_argument("--max-samples", type=int, default=None)
-    p.add_argument("--batch-size",  type=int, default=4)
-    p.add_argument("--split",       default="test")
+    mode.add_argument("--train", action="store_true")
+    mode.add_argument("--eval",  action="store_true")
+    p.add_argument("--dataset", required=True, help="Dataset key, e.g. AIME2024")
     args = p.parse_args()
 
     if args.train:
-        asyncio.run(train_one(args.dataset, epochs=args.epochs, resume=args.resume,
-                              max_samples=args.max_samples, batch_size=args.batch_size))
+        asyncio.run(train_one(args.dataset))
     else:
-        asyncio.run(evaluate_one(args.dataset, split=args.split,
-                                 max_samples=args.max_samples,
-                                 batch_size=args.batch_size))
+        asyncio.run(evaluate_one(args.dataset))
 
 
 if __name__ == "__main__":

@@ -143,7 +143,6 @@ class SkillUpdater:
         self,
         groups: List[Dict[str, Any]],
         concurrency: int = 4,
-        num_skills: int = 3,
     ) -> Dict[str, int]:
         """
         Run extraction + verification + insert on one batch.
@@ -151,17 +150,17 @@ class SkillUpdater:
         Args:
             groups: list of {question, gold_answer, trajectories: [{text, reward}]}
         Returns:
-            {"added": N, "verified": M, "recipes": R}
+            {"added": N, "groups_no_variance": G}
         """
         # Stage 1: Contrastive extraction
-        extraction_results = await self._contrastive_extract(
-            groups, concurrency, num_skills
-        )
+        extraction_results = await self._contrastive_extract(groups, concurrency)
 
         all_skills: List[Dict[str, str]] = []
         all_recipes: List[Dict[str, Any]] = []
-        for r in extraction_results:
+        for gi, r in enumerate(extraction_results):
             if r:
+                for sk in r["skills"]:
+                    sk["_group"] = gi  # source question, for own-question probes
                 all_skills.extend(r["skills"])
                 all_recipes.extend(r["recipes"])
 
@@ -172,8 +171,7 @@ class SkillUpdater:
               f"raw_skills={len(all_skills)}")
 
         if not all_skills:
-            return {"added": 0, "verified": 0, "recipes": 0,
-                    "groups_no_variance": no_var, "n_groups": n_groups}
+            return {"added": 0, "groups_no_variance": no_var}
 
         # Stage 2: Counterfactual verification
         verified = await self._counterfactual_verify(
@@ -181,14 +179,12 @@ class SkillUpdater:
         )
 
         if not verified:
-            return {"added": 0, "verified": 0, "recipes": 0,
-                    "groups_no_variance": no_var, "n_groups": n_groups}
+            return {"added": 0, "groups_no_variance": no_var}
 
         # Insert verified skills directly (no LLM CRUD)
         added = 0
         for skill in verified:
-            ok = await self._insert_skill(skill["name"], skill["description"])
-            if ok:
+            if await self._insert_skill(skill["name"], skill["description"]):
                 added += 1
 
         # Create recipe hyperedges
@@ -201,8 +197,7 @@ class SkillUpdater:
             f"{len(verified)} verified → {added} added, "
             f"[recipe]{recipe_count} recipes"
         )
-        return {"added": added, "verified": len(verified), "recipes": recipe_count,
-                "groups_no_variance": no_var, "n_groups": n_groups}
+        return {"added": added, "groups_no_variance": no_var}
 
     # ── Stage 1: Contrastive step-level extraction ────────────────────────
 
@@ -210,7 +205,6 @@ class SkillUpdater:
         self,
         groups: List[Dict[str, Any]],
         concurrency: int,
-        num_skills: int,
     ) -> List[Optional[Dict[str, Any]]]:
         """
         For each question with reward variance: decompose trajectories into
@@ -220,30 +214,18 @@ class SkillUpdater:
         results: List[Optional[Dict]] = [None] * len(groups)
 
         skip_no_var = [0]
-        skip_no_split = [0]
         empty_extract = [0]
 
         async def _process(idx: int, group: Dict[str, Any]):
             async with semaphore:
                 trajs = group["trajectories"]
-                rewards = [t["reward"] for t in trajs]
-                # Need variance to compare
-                if max(rewards) - min(rewards) < 0.15:  # need some signal
+                # Eq. (2): split the group at reward threshold rho; groups
+                # without both a success and a failure give no contrast.
+                rho = self.builder.cfg.rho
+                good = [t for t in trajs if t["reward"] >= rho]
+                bad = [t for t in trajs if t["reward"] < rho]
+                if not good or not bad:
                     skip_no_var[0] += 1
-                    return
-
-                # Split by mean for even sizes, median for odd
-                # (using strict > / <= avoids the n=2 edge case where max == median)
-                pivot = sum(rewards) / len(rewards)
-                good = [t for t in trajs if t["reward"] > pivot]
-                bad = [t for t in trajs if t["reward"] < pivot]
-                if not good or not bad:
-                    # Fallback: split by max vs rest
-                    max_r = max(rewards)
-                    good = [t for t in trajs if t["reward"] >= max_r]
-                    bad = [t for t in trajs if t["reward"] < max_r]
-                if not good or not bad:
-                    skip_no_split[0] += 1
                     return
 
                 def _fmt(traj_list, label):
@@ -284,8 +266,8 @@ class SkillUpdater:
 
         await asyncio.gather(*[_process(i, g) for i, g in enumerate(groups)])
         print(f"  [Extract info] no_variance={skip_no_var[0]}, "
-              f"no_split={skip_no_split[0]}, empty_extract={empty_extract[0]}")
-        # Stash debug counts on self for the caller (lists can't take attrs)
+              f"empty_extract={empty_extract[0]}")
+        # Expose the no-variance count to the caller (used for early stopping)
         self._last_no_variance = skip_no_var[0]
         return results
 
@@ -296,29 +278,33 @@ class SkillUpdater:
         candidates: List[Dict[str, str]],
         groups: List[Dict[str, Any]],
         concurrency: int,
-        max_checks: int = 1,  # was 2 — halve verify LLM calls
     ) -> List[Dict[str, str]]:
-        """Test each candidate on failed trajectories: would it have helped?"""
-        # Collect failures
-        failures = []
-        for g in groups:
-            for t in g["trajectories"]:
-                if t["reward"] < 0.3:
-                    failures.append({
-                        "question": g["question"],
-                        "gold_answer": g.get("gold_answer", ""),
-                        "text": t["text"],
-                    })
-        if not failures:
-            return candidates  # no failures → keep all
+        """Test each candidate on failed trajectories: would it have helped?
+
+        Paper Eq. (3): K = cfg.cf_k probes on the failed rollouts O-_q of the
+        candidate's own question; with n = 2 there is at most one, so the
+        strict majority is taken over K_eff = min(K, |O-_q|) distinct failures
+        (no repeated vote on the same failure). With cf_distinct_failures=False
+        the K votes cycle over the own failures instead.
+
+        Every candidate comes from a group with at least one failure (Stage 1
+        skips groups without both a success and a failure, with the same
+        threshold rho), so O-_q is never empty."""
+        max_checks = int(self.builder.cfg.cf_k)
+        fail_thr = self.builder.cfg.rho
 
         semaphore = asyncio.Semaphore(concurrency)
         verified = []
         lock = asyncio.Lock()
 
         async def _check(skill: Dict[str, str]):
-            import random
-            sampled = random.sample(failures, min(max_checks, len(failures)))
+            g = groups[skill["_group"]]
+            own = [{"question": g["question"], "gold_answer": g.get("gold_answer", ""),
+                    "text": t["text"]} for t in g["trajectories"] if t["reward"] < fail_thr]
+            if self.builder.cfg.cf_distinct_failures:
+                sampled = own[:max_checks]
+            else:
+                sampled = [own[i % len(own)] for i in range(max_checks)]
             yes_count = 0
 
             for fail in sampled:
@@ -341,7 +327,7 @@ class SkillUpdater:
                     except Exception as exc:
                         logger.warning("verify failed: %s", exc)
 
-            if yes_count >= max(1, len(sampled) // 2):
+            if yes_count * 2 > len(sampled):  # strict majority
                 async with lock:
                     verified.append(skill)
 
@@ -368,7 +354,8 @@ class SkillUpdater:
             "description": description,
             "modality": "text",
             "hop_type": "single",
-            "advantage": 0.3,  # bootstrap positive: skill passed counterfactual verification
+            # bootstrap positive: skill passed counterfactual verification
+            "advantage": 0.3,
             "examples": [],
         }
         await self.builder._upsert_skills([skill_dict])

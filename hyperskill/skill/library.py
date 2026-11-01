@@ -26,9 +26,6 @@ class SkillLibrary:
     """
 
     def __init__(self, cfg: HypergraphConfig, llm_cfg: LLMConfig):
-        self.cfg = cfg
-        self.llm_cfg = llm_cfg
-
         # Builder manages insert / update / prune
         self.builder = HypergraphBuilder(cfg, llm_cfg)
 

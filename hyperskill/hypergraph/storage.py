@@ -69,9 +69,8 @@ class VectorStorage:
       - has(): O(1) existence check to skip embedding for known IDs
     """
 
-    def __init__(self, path: str, dim: int = 1536):
+    def __init__(self, path: str):
         self._path = path
-        self._dim = dim
         os.makedirs(os.path.dirname(path), exist_ok=True)
         self._ids: List[str] = []
         self._id_to_idx: Dict[str, int] = {}   # O(1) lookup
