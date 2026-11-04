@@ -4,7 +4,7 @@ LLM and embedding utilities for HyperSkill.
 OpenRouter integration for HyperSkill:
   - Sync OpenAI client pointing at https://openrouter.ai/api/v1
   - API key from the OPENROUTER_API_KEY environment variable
-  - Generation model : google/gemini-3.1-flash-lite-preview
+  - Generation model : google/gemini-2.5-flash-lite
   - Embedding model  : google/gemini-embedding-2-preview  (dim=3072)
   - Audio/image sent as base64 data URLs via chat completions (no Whisper)
   - ThreadPoolExecutor for parallel batch embedding
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import hashlib
 import json
 import logging
@@ -72,11 +73,34 @@ def _get_client(cfg: LLMConfig) -> OpenAI:
 
 
 # ---------------------------------------------------------------------------
+# Sampling seeds
+# ---------------------------------------------------------------------------
+# When HYPERSKILL_SEED is set (runner --seed), every chat completion carries a
+# `seed` derived from (HYPERSKILL_SEED, salt, request content). The salt
+# separates otherwise identical requests that must stay independent samples:
+# the n training rollouts of one question share their prompt, so each rollout
+# runs with SEED_SALT = "rollout<j>". Seeds depend only on request content, not
+# on call order, so concurrent scheduling does not change them. Without
+# HYPERSKILL_SEED no seed is sent (unseeded sampling).
+
+SEED_SALT: contextvars.ContextVar = contextvars.ContextVar("hyperskill_seed_salt", default="")
+
+
+def _call_seed(ck: str, salt: str) -> Optional[int]:
+    base = os.environ.get("HYPERSKILL_SEED")
+    if not base:
+        return None
+    h = hashlib.sha256(f"{base}|{salt}|{ck}".encode("utf-8")).hexdigest()
+    return int(h[:8], 16) % (2 ** 31 - 1)
+
+
+# ---------------------------------------------------------------------------
 # Response-level cache backed by both in-memory LRU and on-disk JSON files
 # ---------------------------------------------------------------------------
 # Disk cache is essential for reproducibility: two eval runs with the same
 # prompts must return byte-identical responses. Gemini at temperature=0 still
-# exhibits ~1-3% variation across calls without this layer.
+# exhibits ~1-3% variation across calls without this layer. Disabled (no
+# reads, no writes) by HYPERSKILL_DISABLE_LLM_CACHE=1.
 
 _LLM_CACHE_DIR = Path(__file__).resolve().parent.parent / "cache" / "llm"
 _llm_cache: dict = {}
@@ -90,16 +114,18 @@ def _cache_key(
     temperature: float,
     max_tokens: int,
     media: str = "",
+    seed: Optional[int] = None,
 ) -> str:
     """Key over everything that shapes the response. `temperature` and
     `max_tokens` are the effective values actually sent; `media` is the
-    image/audio fingerprint of multimodal calls ("" for text-only)."""
-    payload = json.dumps(
-        {"model": model, "system": system, "prompt": prompt,
-         "temperature": float(temperature), "max_tokens": int(max_tokens),
-         "media": media},
-        ensure_ascii=False, sort_keys=True,
-    )
+    image/audio fingerprint of multimodal calls ("" for text-only); `seed` is
+    the sampling seed sent with the request (not part of unseeded keys)."""
+    fields = {"model": model, "system": system, "prompt": prompt,
+              "temperature": float(temperature), "max_tokens": int(max_tokens),
+              "media": media}
+    if seed is not None:
+        fields["seed"] = int(seed)
+    payload = json.dumps(fields, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -110,6 +136,8 @@ def _disk_path(ck: str) -> Path:
 
 
 def _cache_get(ck: str) -> Optional[str]:
+    if os.environ.get("HYPERSKILL_DISABLE_LLM_CACHE"):
+        return None
     if ck in _llm_cache:
         return _llm_cache[ck]
     p = _disk_path(ck)
@@ -124,6 +152,8 @@ def _cache_get(ck: str) -> Optional[str]:
 
 
 def _cache_set(ck: str, val: str) -> None:
+    if os.environ.get("HYPERSKILL_DISABLE_LLM_CACHE"):
+        return
     if len(_llm_cache) >= _MAX_CACHE:
         for k in list(_llm_cache.keys())[:_MAX_CACHE // 4]:
             del _llm_cache[k]
@@ -209,6 +239,47 @@ def _record_usage(model: str, resp=None, cache_hit: bool = False) -> None:
         logger.warning("usage accounting failed: %s", exc)
 
 
+def _note_meta(meta: Optional[dict], resp=None, cache_hit: bool = False) -> None:
+    """Record finish_reason / completion tokens of a chat call into the
+    caller's `meta` dict (observational only; never raises)."""
+    if meta is None:
+        return
+    try:
+        if cache_hit:
+            meta.update(finish_reason="cache_hit", completion_tokens=None, cache_hit=True)
+            return
+        u = getattr(resp, "usage", None)
+        meta.update(finish_reason=getattr(resp.choices[0], "finish_reason", None),
+                    completion_tokens=int(getattr(u, "completion_tokens", 0) or 0) if u is not None else None,
+                    cache_hit=False)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Transient-error backoff
+# ---------------------------------------------------------------------------
+# On top of the client's own retries, rate limits (429), 5xx, timeouts and
+# connection errors are retried with exponential backoff (5 s .. 60 s, up to
+# HYPERSKILL_TRANSIENT_RETRIES extra attempts, default 8). The request is
+# unchanged, so results are unaffected. 400 Bad Request is NOT retried.
+
+def _with_backoff(fn, **kw):
+    import random as _random
+    import time as _time
+    import openai as _openai
+    transient = (_openai.RateLimitError, _openai.APITimeoutError, _openai.APIConnectionError,
+                 _openai.InternalServerError)
+    tries = int(os.environ.get("HYPERSKILL_TRANSIENT_RETRIES", "8"))
+    for k in range(tries + 1):
+        try:
+            return fn(**kw)
+        except transient:
+            if k == tries:
+                raise
+            _time.sleep(min(60.0, 5.0 * 2 ** k) * (0.75 + 0.5 * _random.random()))
+
+
 # ---------------------------------------------------------------------------
 # Sync text completion
 # ---------------------------------------------------------------------------
@@ -221,18 +292,22 @@ def sync_llm_call(
     system: str = "You are a helpful assistant.",
     use_cache: bool = True,
     temperature: Optional[float] = None,
+    seed_salt: str = "",
+    meta: Optional[dict] = None,
 ) -> str:
     """Single-turn text completion via OpenRouter + Gemini."""
     temperature = temperature if temperature is not None else cfg.temperature
-    ck = _cache_key(cfg.model, system, prompt, temperature, max_tokens)
+    seed = _call_seed(_cache_key(cfg.model, system, prompt, temperature, max_tokens), seed_salt)
+    ck = _cache_key(cfg.model, system, prompt, temperature, max_tokens, seed=seed)
     if use_cache:
         hit = _cache_get(ck)
         if hit is not None:
             _record_usage(cfg.model, cache_hit=True)
+            _note_meta(meta, None, cache_hit=True)
             return hit
 
     client = _get_client(cfg)
-    resp = client.chat.completions.create(
+    resp = _with_backoff(client.chat.completions.create,
         model=cfg.model,
         messages=[
             {"role": "system", "content": system},
@@ -240,9 +315,11 @@ def sync_llm_call(
         ],
         max_tokens=max_tokens,
         temperature=temperature,
+        **({"seed": seed} if seed is not None else {}),
     )
     _record_usage(cfg.model, resp)
     text = resp.choices[0].message.content or ""
+    _note_meta(meta, resp)
     if use_cache:
         _cache_set(ck, text)
     return text
@@ -263,6 +340,8 @@ def sync_llm_call_with_images(
     audio_fmt: str = "wav",
     use_cache: bool = True,
     temperature: Optional[float] = None,
+    seed_salt: str = "",
+    meta: Optional[dict] = None,
 ) -> str:
     """
     Chat completion with inline images (base64 JPEG/PNG) and optional audio.
@@ -275,12 +354,15 @@ def sync_llm_call_with_images(
     # This makes vision/audio calls byte-reproducible across eval runs.
     img_fp = ",".join(hashlib.sha256(b.encode()).hexdigest() for b in image_b64_list)
     aud_fp = f"{audio_fmt}:{hashlib.sha256(audio_bytes).hexdigest()}" if audio_bytes else ""
-    ck = _cache_key(cfg.model, system, prompt, temperature, max_tokens,
-                    media=f"[img:{img_fp}][aud:{aud_fp}]")
+    media_fp = f"[img:{img_fp}][aud:{aud_fp}]"
+    seed = _call_seed(_cache_key(cfg.model, system, prompt, temperature, max_tokens, media=media_fp),
+                      seed_salt)
+    ck = _cache_key(cfg.model, system, prompt, temperature, max_tokens, media=media_fp, seed=seed)
     if use_cache:
         hit = _cache_get(ck)
         if hit is not None:
             _record_usage(cfg.model, cache_hit=True)
+            _note_meta(meta, None, cache_hit=True)
             return hit
 
     client = _get_client(cfg)
@@ -301,7 +383,7 @@ def sync_llm_call_with_images(
         })
     content.append({"type": "text", "text": prompt})
 
-    resp = client.chat.completions.create(
+    resp = _with_backoff(client.chat.completions.create,
         model=cfg.model,
         messages=[
             {"role": "system", "content": system},
@@ -309,9 +391,11 @@ def sync_llm_call_with_images(
         ],
         max_tokens=max_tokens,
         temperature=temperature,
+        **({"seed": seed} if seed is not None else {}),
     )
     _record_usage(cfg.model, resp)
     text = resp.choices[0].message.content or ""
+    _note_meta(meta, resp)
     if use_cache:
         _cache_set(ck, text)
     return text
@@ -341,7 +425,7 @@ def sync_embed_texts(texts: List[str], cfg: LLMConfig) -> np.ndarray:
         batch = [t if t.strip() else " " for t in batch]
         for attempt in range(3):
             try:
-                resp = client.embeddings.create(model=cfg.embedding_model, input=batch)
+                resp = _with_backoff(client.embeddings.create, model=cfg.embedding_model, input=batch)
                 _record_usage(cfg.embedding_model, resp)
                 if not resp.data:
                     raise ValueError("No embedding data received")
@@ -402,12 +486,14 @@ async def async_llm_call(
     system: str = "You are a helpful assistant.",
     use_cache: bool = True,
     temperature: Optional[float] = None,
+    meta: Optional[dict] = None,
 ) -> str:
     import functools
     fn = functools.partial(
         sync_llm_call, prompt, cfg,
         system=system, use_cache=use_cache,
         max_tokens=max_tokens, temperature=temperature,
+        seed_salt=SEED_SALT.get(), meta=meta,
     )
     return await _run_in_executor(fn)
 
@@ -423,6 +509,7 @@ async def async_llm_call_with_images(
     audio_fmt: str = "wav",
     use_cache: bool = True,
     temperature: Optional[float] = None,
+    meta: Optional[dict] = None,
 ) -> str:
     import functools
     fn = functools.partial(
@@ -430,6 +517,7 @@ async def async_llm_call_with_images(
         system=system, max_tokens=max_tokens,
         audio_bytes=audio_bytes, audio_fmt=audio_fmt,
         use_cache=use_cache, temperature=temperature,
+        seed_salt=SEED_SALT.get(), meta=meta,
     )
     return await _run_in_executor(fn)
 

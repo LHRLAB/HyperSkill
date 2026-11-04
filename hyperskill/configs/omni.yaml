@@ -1,12 +1,15 @@
 # HyperSkill — Omni modality config (audio + video + text + image)
 # Datasets: OmniVideoBench, WorldSense
 # Merge order (hyperskill/config.py, load_config):
-#   --train: shared sections -> library_runs[<dataset's library_run>]
-#   --eval:  shared sections -> eval -> datasets.<dataset>.eval
+#   --train: shared sections -> library_runs[<library_run>] -> configs entry "train"
+#   --eval:  shared sections -> eval -> configs entry "eval"
+#   then datasets.<dataset>.harness (both modes)
+# The per-dataset entries ("library_run", "train", "eval", seed) are in
+# configs/final_configs.json.
 
 llm:
   base_url: https://openrouter.ai/api/v1
-  model: google/gemini-3.1-flash-lite-preview
+  model: google/gemini-2.5-flash-lite
   embedding_model: google/gemini-embedding-2-preview
   embedding_dim: 3072
   max_retries: 3
@@ -58,11 +61,7 @@ eval:
 datasets:
   OmniVideoBench:
     library_run: R2
-    eval:
-      hypergraph: {test_min_similarity: 0.2}
   WorldSense:
     library_run: R1
-    eval:
-      hypergraph:
-        hint_synthesis: false        # terse injection
-        test_min_similarity: 0.2
+    harness:                         # shared harness settings (training and evaluation)
+      rollout: {max_new_tokens: 4096, max_frames: 32}

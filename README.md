@@ -13,11 +13,10 @@ HyperSkill: Training-Free Omnimodal GRPO via Hypergraph-Indexed Skill-Library Ev
 ```bash
 conda create -n hyperskill python=3.13 -y
 conda activate hyperskill
-
 pip install -r requirements.txt
 ```
 
-All model calls go through [OpenRouter](https://openrouter.ai/): the backbone `google/gemini-3.1-flash-lite-preview`, the embedding model `google/gemini-embedding-2-preview`, and `google/gemini-3.8-flash` for the `knowledge_search` tool (WebWalkerQA and VL-Web). Create an OpenRouter API key and export it:
+All models (backbone `google/gemini-2.5-flash-lite`) are accessed through [OpenRouter](https://openrouter.ai/); create an API key at https://openrouter.ai/keys and set it as `OPENROUTER_API_KEY`:
 
 ```bash
 export OPENROUTER_API_KEY="your_openrouter_key_here"
@@ -25,39 +24,23 @@ export OPENROUTER_API_KEY="your_openrouter_key_here"
 
 ### 2. Data Preparation
 
-We use HyperSkill-Bench, 11 datasets in four regimes:
-
-| Regime | Datasets |
-|:---|:---|
-| Text | AIME2024, AIME2025, WebWalkerQA |
-| VL-Web | FVQA, InfoSeek, SimpleVQA, LiveVQA |
-| VL-Doc | DocBench, MMLongBench-Doc |
-| Omni | OmniVideoBench, WorldSense |
-
-Download the data from [Hugging Face](https://huggingface.co/datasets/LHRLAB/HyperSkill) into `dataset/`:
+Download the data from [Hugging Face](https://huggingface.co/datasets/LHRLAB/HyperSkill) into `dataset/` (or set `HYPERSKILL_DATA_DIR=/path/to/dataset`), then build the document index:
 
 ```bash
 hf download LHRLAB/HyperSkill --repo-type dataset --local-dir dataset
+pip install rapidocr-onnxruntime==1.2.3
+python scripts/build_doc_index.py --dataset MMLongBench-Doc --ocr
+python scripts/build_doc_index.py --dataset DocBench
 ```
-
-```text
-dataset/
-├── Text/{AIME2024,AIME2025,WebWalkerQA}/
-├── VL-Web/{FVQA,InfoSeek,SimpleVQA,LiveVQA}/
-├── VL-Doc/{DocBench,MMLongBench-Doc}/
-└── Omni/{OmniVideoBench,WorldSense}/
-```
-
-Each dataset directory holds `train.jsonl` (128 training questions), `test.jsonl` (30 test questions for AIME2024/2025, 64 for the others) and `resources/` (the images, PDFs, videos and audio they reference).
 
 ### 3. Implementation
 
 ```bash
-python run.py --train
-python run.py --eval
+bash scripts/train.sh
+bash scripts/eval.sh
 ```
 
-`--train` evolves the skill library of each dataset (1 epoch over the 128 training questions, batch size 4, 2 rollouts per question) and writes it to `expr/skill_library/<dataset>/`. `--eval` answers the test questions with the learned library (1 rollout, temperature 0) and writes token-level F1 to `outputs/hyperskill_<dataset>/eval_results.json`. Both run the 11 datasets in parallel; add `--dataset <name>` to run one, e.g. `python run.py --train --dataset AIME2024`. Per-dataset settings are in [`hyperskill/configs/`](hyperskill/configs/).
+`scripts/train.sh` evolves the skill library of each of the 11 datasets from its training split with the configuration in [`configs/final_configs.json`](configs/final_configs.json) and writes it to `expr/hs_skill_library/<dataset>/`. `scripts/eval.sh` evaluates the learned libraries on the test splits with the same configuration, writes the per-question records to `outputs/hs_hyperskill_<dataset>/eval_results.json`, and prints the F1 scores. Both run all datasets in parallel; to run selected datasets, pass their names, e.g. `bash scripts/train.sh AIME2024 WorldSense` and `bash scripts/eval.sh AIME2024 WorldSense`.
 
 ## BibTeX
 

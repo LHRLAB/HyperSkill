@@ -14,3 +14,6 @@ tqdm>=4.66.0
 pyyaml>=6.0.1
 huggingface_hub==1.7.1      # `hf download` for the dataset
 click>=8.1                  # required by the `hf` CLI
+
+# Only for scripts/build_doc_index.py --ocr (OCR of the image-only MMLongBench-Doc PDFs)
+# rapidocr-onnxruntime==1.2.3

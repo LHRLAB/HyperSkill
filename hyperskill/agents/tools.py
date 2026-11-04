@@ -43,6 +43,7 @@ class SearchTool:
 # cache/gemini_knowledge/text/<sha256(key)>.txt, where the key covers the
 # knowledge model, its system prompt, num_results and the lowercased query.
 # Empty answers (NO_RESULTS) and errors are not cached.
+# Set HYPERSKILL_DISABLE_SEARCH_CACHE=1 to bypass (no reads, no writes).
 # ═══════════════════════════════════════════════════════════════════════════
 
 _CACHE_ROOT = Path(__file__).resolve().parent.parent.parent / "cache" / "gemini_knowledge"
@@ -56,6 +57,8 @@ def _cache_path(kind: str, key: str) -> Path:
 
 
 def _cache_get(kind: str, key: str) -> Optional[str]:
+    if os.environ.get("HYPERSKILL_DISABLE_SEARCH_CACHE"):
+        return None
     p = _cache_path(kind, key)
     if p.exists():
         try:
@@ -66,6 +69,8 @@ def _cache_get(kind: str, key: str) -> Optional[str]:
 
 
 def _cache_put(kind: str, key: str, value: str) -> None:
+    if os.environ.get("HYPERSKILL_DISABLE_SEARCH_CACHE"):
+        return
     try:
         # Write-then-rename: parallel dataset subprocesses share this cache.
         p = _cache_path(kind, key)
@@ -148,6 +153,8 @@ class DocSearchTool(SearchTool):
         for f in sorted(resources.iterdir()):
             if f.suffix.lower() == ".pdf":
                 page_texts = _extract_pdf_text(f)
+                if not any(t.strip() for t in page_texts):     # image-only PDF: OCR sidecar
+                    page_texts = _ocr_pages(self.corpus_dir, f) or page_texts
                 for i, text in enumerate(page_texts):
                     if text.strip():
                         cid = f"doc_{f.stem}_p{i}"
@@ -189,6 +196,10 @@ class DocSearchTool(SearchTool):
             if keep:
                 chunks    = [self._chunks[i]    for i in keep]
                 chunk_ids = [self._chunk_ids[i] for i in keep]
+            else:   # no indexed text for this PDF -> no fallback to the whole corpus
+                names = ", ".join(sorted(Path(p).name for p in restrict_to))
+                return (f"(No text could be extracted from the document {names}: it has no text layer, "
+                        f"so document search returns nothing for it.)")
 
         results = _bm25_search(query, chunks, chunk_ids, top_k)
         if not results:
@@ -325,6 +336,18 @@ def _extract_pdf_text(pdf_path: Path) -> List[str]:
         return []
     except Exception as exc:
         logger.warning("PDF extraction failed for %s: %s", pdf_path, exc)
+        return []
+
+
+def _ocr_pages(corpus_dir: Path, pdf_path: Path) -> List[str]:
+    """Per-page text of an image-only PDF from the local OCR sidecar
+    <corpus>/.ocr_pages/<stem>.json (RapidOCR, made offline by scripts/build_doc_index.py); [] if none."""
+    p = Path(corpus_dir) / ".ocr_pages" / f"{pdf_path.stem}.json"
+    if not p.exists():
+        return []
+    try:
+        return list(json.loads(p.read_text(encoding="utf-8")))
+    except Exception:
         return []
 
 

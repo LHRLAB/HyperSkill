@@ -1,7 +1,8 @@
 """
 Dataset loaders for HyperSkill.
 
-Dataset folder layout (see DATASET_KEYS for each <group>/<name>):
+Dataset folder layout (see DATASET_KEYS for each <group>/<name>); the root is
+$HYPERSKILL_DATA_DIR, default <repo>/dataset:
 
   dataset/<group>/<name>/
     train.jsonl      one JSON object per line: question, gold_answers,
@@ -9,6 +10,10 @@ Dataset folder layout (see DATASET_KEYS for each <group>/<name>):
     resources/       images / PDFs / videos / audio referenced above
 
 train.jsonl (128 questions per dataset) and test.jsonl are used as is.
+
+Splits (`split=`):
+  train128 (= train)   all 128 training questions
+  test                 the test questions
 
 Datasets
 ────────
@@ -26,6 +31,7 @@ Datasets
 from __future__ import annotations
 
 import math
+import os
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,7 +63,9 @@ DATASET_KEYS: Dict[str, Dict[str, str]] = {
 }
 
 
-DATASET_ROOT = Path(__file__).parent.parent.parent / "dataset"
+DATASET_ROOT = Path(os.environ.get("HYPERSKILL_DATA_DIR") or Path(__file__).parent.parent.parent / "dataset")
+
+SPLITS = ("train128", "test")
 
 # ---------------------------------------------------------------------------
 # Data container
@@ -97,15 +105,17 @@ class HyperSkillDataset:
     VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
     AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
 
-    def __init__(self, dataset_name: str, split: str = "train"):
+    def __init__(self, dataset_name: str, split: str = "train",
+                 max_samples: Optional[int] = None):
         import json as _json
         info = DATASET_KEYS.get(dataset_name)
         if info is None:
             raise ValueError(f"Unknown dataset: {dataset_name}. "
                              f"Available: {sorted(DATASET_KEYS)}")
 
+        file_split = "test" if split == "test" else "train"
         self._folder = DATASET_ROOT / info["folder"]
-        jsonl_path   = self._folder / f"{split}.jsonl"
+        jsonl_path   = self._folder / f"{file_split}.jsonl"
         if not jsonl_path.exists():
             raise FileNotFoundError(
                 f"{jsonl_path} not found. See README (Data) for the expected layout."
@@ -120,6 +130,12 @@ class HyperSkillDataset:
                         records.append(_json.loads(line))
         except Exception as e:
             raise RuntimeError(f"Failed to load {jsonl_path}: {e}")
+
+        if split not in ("train", "train128", "test"):
+            raise ValueError(f"unknown split '{split}' (expected one of {SPLITS})")
+
+        if max_samples is not None:      # first N rows (smoke tests)
+            records = records[:max_samples]
 
         self._records = records
         self._info    = info

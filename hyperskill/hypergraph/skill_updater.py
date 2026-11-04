@@ -285,7 +285,9 @@ class SkillUpdater:
         candidate's own question; with n = 2 there is at most one, so the
         strict majority is taken over K_eff = min(K, |O-_q|) distinct failures
         (no repeated vote on the same failure). With cf_distinct_failures=False
-        the K votes cycle over the own failures instead.
+        the K votes cycle over the own failures instead (library run R1); each
+        vote is tagged "<!-- vote k -->", so repeated votes on the same failure
+        are independent samples rather than one cached response.
 
         Every candidate comes from a group with at least one failure (Stage 1
         skips groups without both a success and a failure, with the same
@@ -305,18 +307,22 @@ class SkillUpdater:
                 sampled = own[:max_checks]
             else:
                 sampled = [own[i % len(own)] for i in range(max_checks)]
+            vote_tag = not self.builder.cfg.cf_distinct_failures
             yes_count = 0
 
-            for fail in sampled:
+            for k, fail in enumerate(sampled):
+                prompt = SKILL_COUNTERFACTUAL_VERIFY_UP.format(
+                    question=fail["question"][:500],
+                    gold_answer=fail["gold_answer"][:200],
+                    failed_trajectory=fail["text"][:1500],
+                    skill=f"{skill['name']}: {skill['description']}",
+                )
+                if vote_tag:
+                    prompt += f"\n<!-- vote {k} -->"
                 async with semaphore:
                     try:
                         resp = await async_llm_call(
-                            prompt=SKILL_COUNTERFACTUAL_VERIFY_UP.format(
-                                question=fail["question"][:500],
-                                gold_answer=fail["gold_answer"][:200],
-                                failed_trajectory=fail["text"][:1500],
-                                skill=f"{skill['name']}: {skill['description']}",
-                            ),
+                            prompt=prompt,
                             cfg=self.llm_cfg,
                             system=SKILL_COUNTERFACTUAL_VERIFY_SP,
                             max_tokens=100,
@@ -332,6 +338,9 @@ class SkillUpdater:
                     verified.append(skill)
 
         await asyncio.gather(*[_check(s) for s in candidates])
+        # Insert in candidate order, not completion order (reproducible library).
+        order = {id(s): i for i, s in enumerate(candidates)}
+        verified.sort(key=lambda s: order[id(s)])
 
         if len(verified) < len(candidates):
             print(

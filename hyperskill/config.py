@@ -8,11 +8,18 @@ Every dataset is configured by the YAML of its modality (hyperskill/configs/
   library_runs.<R1|R2|R3>                   training settings of a library run
   eval                                      evaluation defaults
   datasets.<name>                           the dataset's library run and its
-                                            evaluation overrides
+                                            shared harness settings
 
 `load_config(yaml_path, dataset, mode)` merges them in this order:
   train: shared -> library_runs[datasets.<name>.library_run]
-  test:  shared -> eval -> datasets.<name>.eval
+  test:  shared -> eval -> datasets.<name>.eval (if any)
+
+`override` (one dataset's entry of a configs JSON, by default
+configs/final_configs.json; see run.py --configs) can replace the dataset's
+entry: `library_run` replaces datasets.<name>.library_run, `train` is overlaid
+after the library run, and `eval`, when present, replaces datasets.<name>.eval.
+Last, datasets.<name>.harness (shared harness settings such as the number of
+video frames) is applied in both modes.
 """
 
 from __future__ import annotations
@@ -35,7 +42,7 @@ class LLMConfig:
     """LLM and embedding model settings (OpenRouter). The API key is read from
     the OPENROUTER_API_KEY environment variable (hyperskill/llm.py)."""
     base_url: str = "https://openrouter.ai/api/v1"
-    model: str = "google/gemini-3.1-flash-lite-preview"
+    model: str = "google/gemini-2.5-flash-lite"
     embedding_model: str = "google/gemini-embedding-2-preview"
     embedding_dim: int = 3072
     temperature: float = 0.4          # rollout temperature (evaluation: 0)
@@ -83,14 +90,52 @@ class HypergraphConfig:
     # (ii) schema-constrained hint: P7 keeps the output schema (short final
     #      answer in <answer> tags) and, in tool regimes, the tool budget.
     schema_constrained_hint: bool = False
-    # (iii) tool-neutral hint: in tool regimes, P7 never tells the agent to search.
-    tool_neutral_hint: bool = False
-    # (iv) answer-form line derived from the gold answers of each skill's 5
-    #      nearest training questions (option letter / short phrase / free form).
+    # (iii) answer-form line derived from the gold answers of each skill's 5
+    #       nearest training questions (option letter / short phrase / free form).
     answer_form_line: bool = False
-    # (v) completion clause: in tool regimes, give the best final answer after
-    #     at most the tool budget.
-    completion_clause: bool = False
+    # (iv) protocol skill (hyperskill/strategies/protocol.py): the output-protocol
+    #      failure types seen in >= protocol_min_count training rollouts (malformed
+    #      tool call, tool call after the budget, tool call without tools, no
+    #      <answer>) become one always-injected skill, re-injected after each tool
+    #      turn with the remaining budget. Training: injected once a type is seen.
+    protocol_skill: bool = False
+    protocol_min_count: int = 2
+    # "short": fixed short-answer line; "data": answer line derived from the
+    # training gold answers (option letter / short phrase / one sentence, plus
+    # the exact wording of a gold string that covers >= 10% of them)
+    protocol_answer_form: str = "short"
+
+    # -- Agent strategies (hyperskill/strategies/; all off by default) --------
+    # Prompt and tool calls (strategies/prompting.py):
+    #   the search format names the real tool tag with one concrete call (no
+    #   TOOL_TAG placeholder); no search format when no tool is offered.
+    concrete_tool_prompt: bool = False
+    #   one final-answer turn when a rollout would end without a closed <answer>.
+    final_answer_turn: bool = False
+    #   answer form after the question: math -> integer in <answer> (no \boxed{});
+    #   multiple choice -> option letter in <answer>.
+    answer_suffix: bool = False
+    #   the tool-call parser also accepts the TOOL_TAG placeholder forms.
+    tool_parse_lenient: bool = False
+    #   doc_search on a PDF without indexed text: explicit message, no search.
+    doc_own_only: bool = False
+    # Evaluation only:
+    #   self-consistency (strategies/voting.py): vote_k rollouts sampled at
+    #   vote_temperature besides the greedy one, majority vote on the final answer,
+    #   tie -> greedy; vote_skip_refusals: refusal answers do not vote.
+    vote_k: int = 0
+    vote_temperature: float = 0.7
+    vote_skip_refusals: bool = False
+    #   doc QA (strategies/locate_pages.py): text of the top-n BM25 pages of the
+    #   question's own PDF after the question (0 = off).
+    locate_pages: int = 0
+    #   web QA (strategies/presearch.py): the question itself is sent as a first
+    #   knowledge-search query; results after the question.
+    question_presearch: bool = False
+    #   omni multiple choice (strategies/video.py): video length and the time of
+    #   every keyframe after the question / per-option evidence check line.
+    time_grounding: bool = False
+    option_check: bool = False
 
 
 @dataclass
@@ -101,6 +146,7 @@ class RolloutConfig:
     max_prompt_length: int = 8096    # word budget
     max_new_tokens: int = 1024
     text_search_limit: int = 2       # tool calls per question
+    max_frames: int = 8              # video keyframes per question
 
 
 @dataclass
@@ -124,6 +170,8 @@ class DataConfig:
     """Dataset and modality settings."""
     modality: str = "text"           # "text" | "vl" | "omni"
     dataset_names: List[str] = field(default_factory=list)
+    train_split: str = "train128"    # questions the library is trained on; also used by
+                                     # the hub correction and the answer-form line
 
 
 @dataclass
@@ -160,7 +208,8 @@ def _overlay(cfg: HyperSkillConfig, block: Dict[str, Any], where: str) -> None:
             setattr(sub, key, val)
 
 
-def load_config(yaml_path: str, dataset: str, mode: str) -> HyperSkillConfig:
+def load_config(yaml_path: str, dataset: str, mode: str,
+                override: Dict[str, Any] | None = None) -> HyperSkillConfig:
     """Build the config of `dataset` for `mode` ("train" | "test")."""
     with open(yaml_path, "r", encoding="utf-8") as f:
         raw: Dict[str, Any] = yaml.safe_load(f) or {}
@@ -168,6 +217,15 @@ def load_config(yaml_path: str, dataset: str, mode: str) -> HyperSkillConfig:
     ds_cfg = (raw.get("datasets") or {}).get(dataset)
     if ds_cfg is None:
         raise ValueError(f"{yaml_path}: no entry for dataset '{dataset}'")
+    override = override or {}
+    unknown = set(override) - {"library_run", "train", "eval", "seed", "note"}
+    if unknown:
+        raise ValueError(f"configs entry of {dataset}: unknown keys {sorted(unknown)}")
+    ds_cfg = dict(ds_cfg)
+    if "library_run" in override:
+        ds_cfg["library_run"] = override["library_run"]
+    if "eval" in override:
+        ds_cfg["eval"] = override["eval"]
 
     cfg = HyperSkillConfig()
     cfg.mode = mode
@@ -179,7 +237,11 @@ def load_config(yaml_path: str, dataset: str, mode: str) -> HyperSkillConfig:
         if cfg.library_run not in runs:
             raise ValueError(f"{yaml_path}: unknown library run '{cfg.library_run}'")
         _overlay(cfg, runs[cfg.library_run], f"{yaml_path}: library_runs.{cfg.library_run}")
+        _overlay(cfg, override.get("train"), f"configs entry of {dataset}: train")
     else:
         _overlay(cfg, raw.get("eval"), f"{yaml_path}: eval")
         _overlay(cfg, ds_cfg.get("eval"), f"{yaml_path}: datasets.{dataset}.eval")
+    # shared harness settings of the dataset (applied last, so a configs entry
+    # cannot replace them)
+    _overlay(cfg, ds_cfg.get("harness"), f"{yaml_path}: datasets.{dataset}.harness")
     return cfg

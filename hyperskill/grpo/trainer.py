@@ -14,9 +14,13 @@ No model parameters are updated — the skill library IS the evolving policy.
 from __future__ import annotations
 import asyncio
 import copy
+import hashlib
+import json
 import logging
+import os
 import re
 import time
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 from typing import Any, Dict, List, Optional
@@ -57,6 +61,43 @@ def _extract_keyframes(video_path: str, max_frames: int = 3) -> List[str]:
         return frames
     except Exception:
         return []
+
+
+_KEYFRAME_CACHE_DIR = Path(__file__).resolve().parent.parent.parent / "cache" / "keyframes"
+
+
+def install_keyframe_cache() -> None:
+    """Memoise _extract_keyframes on disk (cache/keyframes): a pure function of the
+    video file and max_frames, so the frames are identical; they are extracted once
+    per video instead of once per rollout."""
+    global _extract_keyframes
+    if getattr(_extract_keyframes, "_cached", False):
+        return
+    orig = _extract_keyframes
+
+    def cached(video_path: str, max_frames: int = 3):
+        try:
+            st = os.stat(video_path)
+            k = hashlib.sha256(f"{os.path.realpath(video_path)}|{st.st_size}|{st.st_mtime_ns}|{max_frames}".encode()).hexdigest()
+        except OSError:
+            return orig(video_path, max_frames)
+        f = _KEYFRAME_CACHE_DIR / k[:2] / f"{k}.json"
+        if f.exists():
+            try:
+                return json.loads(f.read_text())
+            except Exception:
+                pass
+        frames = orig(video_path, max_frames)
+        if frames:
+            try:
+                f.parent.mkdir(parents=True, exist_ok=True)
+                tmp = f.with_name(f"{f.name}.{os.getpid()}.tmp")
+                tmp.write_text(json.dumps(frames)); os.replace(tmp, f)
+            except OSError:
+                pass
+        return frames
+    cached._cached = True
+    _extract_keyframes = cached
 
 
 def _extract_audio_from_video(video_path: str) -> Optional[bytes]:
@@ -102,22 +143,78 @@ class HyperSkillGRPOTrainer:
 
         self._llm_cfg = cfg.llm
 
+        # Protocol skill (strategies/protocol.py): failure-type counts of the
+        # training rollouts; at evaluation they are loaded from the library.
+        from ..strategies.protocol import ProtocolStats
+        hcfg = cfg.hypergraph
+        self.protocol = ProtocolStats(hcfg.protocol_min_count)
+        if cfg.mode == "test":
+            loaded = ProtocolStats.load(hcfg.working_dir, hcfg.protocol_min_count)
+            if loaded is not None:
+                self.protocol = loaded
+            elif hcfg.protocol_skill:
+                raise RuntimeError(f"protocol_skill is on but {hcfg.working_dir} has no protocol_skill.json")
+
+    def _protocol_ctx(self, item) -> str:
+        """Protocol-skill text for `item` ("" when disabled or nothing learned yet)."""
+        if not self.cfg.hypergraph.protocol_skill:
+            return ""
+        from ..agents.tools import TOOL_PROFILES
+        from ..strategies.protocol import protocol_text, answer_form
+        hcfg = self.cfg.hypergraph
+        if hcfg.protocol_answer_form not in ("short", "data"):
+            raise ValueError(f"protocol_answer_form must be short|data, not {hcfg.protocol_answer_form}")
+        if hcfg.protocol_answer_form == "data" and getattr(self, "_gold_form", None) is None:
+            from ..datasets.loaders import HyperSkillDataset
+            ds = self.cfg.data.dataset_names[0]
+            self._gold_form = answer_form([it.gold_answers[0] if it.gold_answers else ""
+                                           for it in HyperSkillDataset(ds, self.cfg.data.train_split)])
+        form = self._gold_form if hcfg.protocol_answer_form == "data" else None
+        tags = list(TOOL_PROFILES.get(item.task_type, []))
+        return protocol_text(self.protocol.active, item.task_type, tags,
+                             self.cfg.rollout.text_search_limit, self.cfg.rollout.max_new_tokens, form)
+
+    def _is_mc(self) -> bool:
+        """>= 50% of the training golds are option letters."""
+        if getattr(self, "_gold_form", None) is None:
+            from ..datasets.loaders import HyperSkillDataset
+            from ..strategies.protocol import answer_form
+            ds = self.cfg.data.dataset_names[0]
+            self._gold_form = answer_form([it.gold_answers[0] if it.gold_answers else ""
+                                           for it in HyperSkillDataset(ds, self.cfg.data.train_split)])
+        return (self._gold_form or {}).get("mc", 0.0) >= 0.5
+
+    def _build_prompt(self, item, skills, tool_desc: str, skills_context) -> str:
+        """Initial prompt (strategies/prompting.py); with every option off this is
+        build_skill_augmented_prompt unchanged. Lines after the question: answer_suffix,
+        and at evaluation the locate_pages block and the time_grounding / option_check lines."""
+        from ..strategies.prompting import build_prompt, answer_suffix, join_suffix
+        hcfg = self.cfg.hypergraph
+        suffix = ""
+        if hcfg.answer_suffix:
+            suffix = answer_suffix(item.task_type, item.task_type != "math" and self._is_mc())
+        if self.cfg.mode == "test":
+            from ..strategies import locate_pages, video
+            lp = locate_pages.lp_suffix(self, item)
+            suffix = f"{lp}\n\n{suffix}" if lp and suffix else (lp or suffix)
+            suffix = join_suffix(suffix, video.prompt_suffix(self, item))
+        return build_prompt(question=item.question, modality=self.cfg.data.modality, skills=skills,
+                            tool_desc=tool_desc, skills_context=skills_context,
+                            v2=hcfg.concrete_tool_prompt, suffix=suffix)
+
     async def _skill_context(self, question: str, skills, task_type: str = "") -> Optional[str]:
         """P7 hint synthesis (App. A.3) when enabled and |S_q| > 0; None
         means "use the default terse format" (or no injection if no skills)."""
         if not skills or not self.cfg.hypergraph.hint_synthesis:
             return None
         from ..llm import async_llm_call
-        from ..prompts import (SKILL_SUMMARY_PROMPT, SKILL_SUMMARY_SCHEMA,
-                               SKILL_SUMMARY_SCHEMA_TOOLS, SKILL_SUMMARY_TOOL_NEUTRAL)
+        from ..prompts import SKILL_SUMMARY_PROMPT, SKILL_SUMMARY_SCHEMA, SKILL_SUMMARY_SCHEMA_TOOLS
         from ..agents.tools import TOOL_PROFILES
         hcfg = self.cfg.hypergraph
         has_tools = bool(task_type and TOOL_PROFILES.get(task_type))
         raw = "\n".join(f"- {getattr(s, 'name', '')}: {getattr(s, 'description', '')}" for s in skills)
         p7 = SKILL_SUMMARY_PROMPT.format(question=question[:2000], skills_raw=raw)
         tail = "\nStrategy hint (2-3 sentences, actionable):"
-        if hcfg.tool_neutral_hint and has_tools:
-            p7 = p7.replace(tail, SKILL_SUMMARY_TOOL_NEUTRAL + tail)
         if hcfg.schema_constrained_hint:
             clause = SKILL_SUMMARY_SCHEMA_TOOLS.format(limit=self.cfg.rollout.text_search_limit) if has_tools else ""
             p7 = p7.replace(tail, SKILL_SUMMARY_SCHEMA.format(tool_clause=clause) + tail)
@@ -132,12 +229,13 @@ class HyperSkillGRPOTrainer:
         return hint or None
 
     async def _train_split_embeddings(self):
-        """(normalised TRAIN question embeddings, gold word-lengths), cached per trainer."""
+        """(normalised TRAIN question embeddings, gold word-lengths), cached per trainer.
+        TRAIN is the split the library was trained on (cfg.data.train_split)."""
         if getattr(self, "_train_emb", None) is None:
             from ..datasets.loaders import HyperSkillDataset
             from ..llm import async_embed_texts
             ds = self.cfg.data.dataset_names[0]
-            items = list(HyperSkillDataset(ds, "train"))
+            items = list(HyperSkillDataset(ds, self.cfg.data.train_split))
             Q = np.asarray(await async_embed_texts([it.question for it in items], self._llm_cfg), dtype=np.float32)
             Q /= np.linalg.norm(Q, axis=1, keepdims=True) + 1e-8
             lens = [len(str(it.gold_answers[0]).split()) if it.gold_answers else 1 for it in items]
@@ -164,16 +262,11 @@ class HyperSkillGRPOTrainer:
         self._ans_len = {sid: float(np.median(lens[t])) for sid, t in zip(vdb._ids, top)}
 
     def _form_line(self, skills, task_type: str) -> str:
-        """Line appended to the injected skills: the completion clause
-        (variant v) or the answer-form line (variant iv)."""
+        """Answer-form line appended to the injected skills (answer_form_line)."""
         from ..agents.tools import TOOL_PROFILES
         hcfg = self.cfg.hypergraph
         budget = (f"Use at most {self.cfg.rollout.text_search_limit} searches; "
                   f"after that, give your best final answer.")
-        if hcfg.completion_clause:
-            if not TOOL_PROFILES.get(task_type):
-                return ""
-            return "Always end with your final answer inside <answer>...</answer>. " + budget
         if not hcfg.answer_form_line:
             return ""
         L = [self._ans_len[s.skill_id] for s in skills if getattr(s, "skill_id", None) in self._ans_len]
@@ -194,14 +287,15 @@ class HyperSkillGRPOTrainer:
         return line
 
     async def _hub_means(self) -> Dict[str, float]:
-        """mu_v = mean cosine of every skill node to the dataset's TRAIN questions."""
+        """mu_v = mean cosine of every skill node to the dataset's TRAIN questions
+        (the split the library was trained on, cfg.data.train_split)."""
         from ..datasets.loaders import HyperSkillDataset
         from ..llm import async_embed_texts
         vdb = self.skill_library.builder.vdb_skills
         if len(vdb) == 0 or vdb._vecs is None:
             return {}
         ds = self.cfg.data.dataset_names[0]
-        qs = [it.question for it in HyperSkillDataset(ds, "train")]
+        qs = [it.question for it in HyperSkillDataset(ds, self.cfg.data.train_split)]
         Q = np.asarray(await async_embed_texts(qs, self._llm_cfg), dtype=np.float32)
         Q /= np.linalg.norm(Q, axis=1, keepdims=True) + 1e-8
         S = np.asarray(vdb._vecs, dtype=np.float32)
@@ -307,8 +401,11 @@ class HyperSkillGRPOTrainer:
                     print(f"[EarlyStop] batch {batch_idx+1}/{total_batches}: {stop_reason}")
                     break
 
-        # Save final library
+        # Save final library (and the protocol-skill statistics next to it)
         self.skill_library.save()
+        self.protocol.save(self.cfg.hypergraph.working_dir)
+        print(f"  [protocol] {self.protocol.n_rollouts} rollouts, counts={self.protocol.counts}, "
+              f"active={self.protocol.active}", flush=True)
 
         return {
             "avg_f1": total_f1 / max(1, batch_count),
@@ -368,16 +465,20 @@ class HyperSkillGRPOTrainer:
                 corpus_dir=item.dataset_dir,
             )
             tool_desc = format_available_tools(tools)
-            prompt = build_skill_augmented_prompt(
-                question=item.question,
-                modality=self.cfg.data.modality,
-                skills=skills,
-                tool_desc=tool_desc,
-                skills_context=group_ctx[idx_e // n],
-            )
+            ctx = group_ctx[idx_e // n]
+            pctx = self._protocol_ctx(item)
+            if pctx:
+                from ..prompts import format_skills_context
+                ctx = (ctx or (format_skills_context(skills) if skills else ""))
+                ctx = f"{ctx}\n{pctx}" if ctx else pctx
+            prompt = self._build_prompt(item, skills, tool_desc, ctx)
             rollout_prompts.append(prompt)
 
-        rollouts = await self._generate_rollouts(expanded, rollout_prompts)
+        rollouts = await self._generate_rollouts(
+            expanded, rollout_prompts, rollout_ids=[i % n for i in range(len(expanded))])
+        for roll in rollouts:
+            if "fail" in roll:              # errored rollouts carry no failure type
+                self.protocol.add(roll["fail"], roll.get("shape"))
 
         # -- Step 3: Compute rewards per group ---------------------------
         updater_groups: List[Dict[str, Any]] = []
@@ -533,16 +634,22 @@ class HyperSkillGRPOTrainer:
         self,
         items: List[DataBatch],
         prompts: List[str],
+        rollout_ids: Optional[List[int]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Generate agentic rollouts for all items concurrently.
         Handles multi-turn search loops (websearch tasks).
         Failed rollouts return an empty-response placeholder.
+        `rollout_ids[i]` (j-th rollout of its question) salts the sampling
+        seed so that seeded rollouts of the same question stay distinct.
         """
+        from ..llm import SEED_SALT
         max_concurrent = min(len(items), 40)
         semaphore = asyncio.Semaphore(max_concurrent)
+        rollout_ids = rollout_ids or [0] * len(items)
 
-        async def _generate_one(item: DataBatch, prompt: str) -> Dict[str, Any]:
+        async def _generate_one(item: DataBatch, prompt: str, rid: int) -> Dict[str, Any]:
+            SEED_SALT.set(f"rollout{rid}")   # task-local (each gather task has its own context)
             async with semaphore:
                 try:
                     return await self._single_rollout(item, prompt)
@@ -551,7 +658,7 @@ class HyperSkillGRPOTrainer:
                     return {"full_response": "", "response_list": []}
 
         results = await asyncio.gather(
-            *[_generate_one(item, prompt) for item, prompt in zip(items, prompts)]
+            *[_generate_one(item, prompt, rid) for item, prompt, rid in zip(items, prompts, rollout_ids)]
         )
         return list(results)
 
@@ -559,9 +666,11 @@ class HyperSkillGRPOTrainer:
         self,
         item: DataBatch,
         initial_prompt: str,
+        llm_cfg=None,
     ) -> Dict[str, Any]:
         """
         Execute one agentic rollout with unified multi-turn tool dispatch.
+        `llm_cfg` (sampled vote rollouts) replaces self._llm_cfg for the rollout's calls.
 
         Tools are determined by dataset type (see agents/tools.py).
         Skills are re-injected at each search turn for context-adaptive augmentation.
@@ -571,6 +680,7 @@ class HyperSkillGRPOTrainer:
         from ..prompts import format_skills_context, AFTER_SEARCH_PROMPT
         import base64
 
+        llm_cfg = llm_cfg or self._llm_cfg
         prompt = initial_prompt
         response_list: List[str] = []
         image_b64_list = [
@@ -581,7 +691,7 @@ class HyperSkillGRPOTrainer:
         # better temporal coverage than 3 — most video QA needs more than
         # first/middle/last to localise events.
         if item.video_path and not image_b64_list:
-            keyframes = _extract_keyframes(item.video_path, max_frames=8)
+            keyframes = _extract_keyframes(item.video_path, max_frames=self.cfg.rollout.max_frames)
             image_b64_list.extend(keyframes)
 
         # Audio path: use the dataset's .wav (WorldSense only); fall back to
@@ -609,6 +719,9 @@ class HyperSkillGRPOTrainer:
         max_searches = self.cfg.rollout.text_search_limit  # total search cap
         search_count = 0
         seen_queries: set = set()
+        end_reason = "rounds"
+        # protocol skill: re-inject the remaining tool budget after each tool turn
+        reinject = bool(self.cfg.hypergraph.protocol_skill and self.protocol.active and tools)
 
         rollout_system = "You are a helpful assistant."
 
@@ -618,18 +731,21 @@ class HyperSkillGRPOTrainer:
         # them into identical samples and remove the GRPO variance.
         use_cache = (self.cfg.mode == "test")
 
+        finish: List[Dict[str, Any]] = []      # finish_reason etc. per LLM call (logging only)
         for _ in range(max_rounds):
             # Generate next response
+            meta: Dict[str, Any] = {}
             if image_b64_list or audio_bytes_to_send:
                 response = await async_llm_call_with_images(
                     prompt=prompt,
                     image_b64_list=image_b64_list,
-                    cfg=self._llm_cfg,
+                    cfg=llm_cfg,
                     max_tokens=self.cfg.rollout.max_new_tokens,
                     system=rollout_system,
                     audio_bytes=audio_bytes_to_send,
                     audio_fmt=audio_fmt,
                     use_cache=use_cache,
+                    meta=meta,
                 )
                 # Audio is in conversation history now; don't re-send on
                 # subsequent search rounds.
@@ -637,31 +753,37 @@ class HyperSkillGRPOTrainer:
             else:
                 response = await async_llm_call(
                     prompt=prompt,
-                    cfg=self._llm_cfg,
+                    cfg=llm_cfg,
                     use_cache=use_cache,
                     max_tokens=self.cfg.rollout.max_new_tokens,
                     system=rollout_system,
+                    meta=meta,
                 )
 
+            finish.append(meta)
             response_list.append(response)
             prompt += response
 
             # Check termination
             if len(prompt.split()) >= self.cfg.rollout.max_prompt_length:
+                end_reason = "length"
                 break
             if "<answer>" in response and "</answer>" in response:
+                end_reason = "answer"
                 break
 
             # Try each registered tool's tag
             action_taken = False
             if search_count >= max_searches:
+                end_reason = "budget"
                 break  # hit search limit → stop
+            from ..strategies.prompting import parse_tool_call
+            call = parse_tool_call(response, list(tools), lenient=self.cfg.hypergraph.tool_parse_lenient)
             for tag, tool in tools.items():
-                pattern = rf"<{tag}>(.*?)</{tag}>"
-                match = re.search(pattern, response, re.DOTALL)
-                if match:
-                    query = match.group(1).strip()
+                if call is not None and call[0] == tag:
+                    query = call[1]
                     if query in seen_queries:
+                        end_reason = "repeat"
                         break  # repeated query → stop
                     seen_queries.add(query)
                     search_count += 1
@@ -669,7 +791,13 @@ class HyperSkillGRPOTrainer:
                     # Execute the tool. For doc_search, restrict ranking to the
                     # PDF this question is about — corpus may have hundreds of
                     # unrelated docs that would otherwise dominate BM25.
-                    if tag == "doc_search" and item.resource_paths:
+                    no_text = None
+                    if tag == "doc_search" and item.resource_paths and self.cfg.hypergraph.doc_own_only:
+                        from ..strategies.prompting import doc_no_text_message
+                        no_text = doc_no_text_message(tool, item.resource_paths)
+                    if no_text is not None:
+                        search_result = no_text
+                    elif tag == "doc_search" and item.resource_paths:
                         search_result = await tool.search(
                             query=query, restrict_to=item.resource_paths,
                         )
@@ -697,6 +825,10 @@ class HyperSkillGRPOTrainer:
                         question=item.question,
                         search_results=f"[{tool.name} Results]\n{search_result}",
                     )
+                    if reinject:
+                        from ..strategies.protocol import reinject_text
+                        rem = reinject_text(list(tools), search_count, max_searches)
+                        skill_ctx = f"{skill_ctx}\n{rem}" if skill_ctx and skill_ctx != "(No relevant skills found)" else rem
                     if skill_ctx and skill_ctx != "(No relevant skills found)":
                         after += f"\n\n--- Updated Skills ---\n{skill_ctx}\n--- End ---\n"
                     prompt += after
@@ -704,10 +836,81 @@ class HyperSkillGRPOTrainer:
                     break
 
             if not action_taken:
+                if end_reason != "repeat":
+                    end_reason = "no_action"
                 break  # no tool action → stop
 
+        from ..strategies.protocol import classify_rollout, malformed_shape
+        # protocol statistics: the rollout as the policy ended it (before any final-answer turn)
+        fail = classify_rollout(response_list, list(tools), end_reason)
+        shape = malformed_shape(response_list) if fail == "malformed_tool" else None
+        final_turn = False
+        if self.cfg.hypergraph.final_answer_turn and response_list:
+            from ..strategies.prompting import has_closed_answer, final_turn_text
+            if not has_closed_answer(response_list[-1]):
+                # final_answer_turn: ask once for the final answer (no tool is executed afterwards)
+                prompt += final_turn_text(end_reason, item.task_type,
+                                          item.task_type != "math" and self._is_mc())
+                meta = {}
+                if image_b64_list or audio_bytes_to_send:
+                    response = await async_llm_call_with_images(
+                        prompt=prompt, image_b64_list=image_b64_list, cfg=llm_cfg,
+                        max_tokens=self.cfg.rollout.max_new_tokens, system=rollout_system,
+                        audio_bytes=audio_bytes_to_send, audio_fmt=audio_fmt,
+                        use_cache=use_cache, meta=meta)
+                else:
+                    response = await async_llm_call(
+                        prompt=prompt, cfg=llm_cfg, use_cache=use_cache,
+                        max_tokens=self.cfg.rollout.max_new_tokens, system=rollout_system, meta=meta)
+                finish.append(meta)
+                response_list.append(response)
+                final_turn = True
         full_response = "\n".join(response_list)
-        return {"full_response": full_response, "response_list": response_list}
+        out = {"full_response": full_response, "response_list": response_list,
+               "end": end_reason, "fail": fail, "finish": finish, "shape": shape}
+        if final_turn:
+            out["final_turn"] = True
+        return out
+
+    async def _eval_rollout(self, item, prompt: str) -> Dict[str, Any]:
+        """Evaluation rollout: question_presearch, then self-consistency (vote_k) or one
+        _single_rollout; records of the located pages / pre-search / video timing."""
+        hcfg = self.cfg.hypergraph
+        rec_qp = None
+        if hcfg.question_presearch:
+            from ..agents.tools import build_tools
+            from ..strategies.presearch import presearch
+            tools = build_tools(task_type=item.task_type, dataset_name=item.source, corpus_dir=item.dataset_dir)
+            prompt, rec_qp = await presearch(tools, item, prompt)
+        if hcfg.vote_k > 0:
+            import dataclasses
+            from ..llm import SEED_SALT
+            from ..strategies.voting import vote_rollouts, answer_kind, SEED_SALT as VOTE_SALT
+            is_mc = item.task_type != "math" and self._is_mc()
+            samp_cfg = dataclasses.replace(self._llm_cfg, temperature=hcfg.vote_temperature)
+            salt = VOTE_SALT[bool(hcfg.vote_skip_refusals)]
+
+            async def one(j):
+                if j is None:
+                    return await self._single_rollout(item, prompt)
+                SEED_SALT.set(f"{salt}{j}")        # task-local: each gathered rollout is its own task
+                return await self._single_rollout(item, prompt, llm_cfg=samp_cfg)
+            out = await vote_rollouts(one, hcfg.vote_k, answer_kind(item.task_type, is_mc), item.question,
+                                      skip_refusals=hcfg.vote_skip_refusals)
+        else:
+            out = await self._single_rollout(item, prompt)
+        from ..strategies import locate_pages, video
+        lp = locate_pages.lp_record(self, item)
+        if lp is not None:
+            out = dict(out)
+            out["located_pages"] = lp
+        if rec_qp is not None:
+            out = dict(out)
+            out["presearch"] = rec_qp
+        if hcfg.time_grounding and item.video_path and not item.images:
+            out = dict(out)
+            out["video_timing"] = video.video_timing(self, item)
+        return out
 
     # ------------------------------------------------------------------
     # Evaluation mode
@@ -749,19 +952,19 @@ class HyperSkillGRPOTrainer:
                     line = self._form_line(skills, item.task_type)
                     if line:
                         skills_context = (skills_context or format_skills_context(skills)) + "\n" + line
-                prompt = build_skill_augmented_prompt(
-                    question=item.question,
-                    modality=self.cfg.data.modality,
-                    skills=skills,
-                    tool_desc=tool_desc,
-                    skills_context=skills_context,
-                )
+                pctx = self._protocol_ctx(item)
+                if pctx:
+                    skills_context = (skills_context or (format_skills_context(skills) if skills else ""))
+                    skills_context = f"{skills_context}\n{pctx}" if skills_context else pctx
+                prompt = self._build_prompt(item, skills, tool_desc, skills_context)
                 rec = {"idx": item._eval_idx,
                        "question": item.question[:200], "gold": item.gold_answers[:3],
+                       "gold_all": list(item.gold_answers),
                        "skills": [getattr(s, "name", "") for s in skills],
-                       "context": (skills_context or "")[:400]}
+                       "context": (skills_context or "")[:400],
+                       "context_full": skills_context or ""}
                 try:
-                    rollout = await self._single_rollout(item, prompt)
+                    rollout = await self._eval_rollout(item, prompt)
                 except Exception as exc:
                     # scored 0.0, counted and logged
                     errors.append(f"{type(exc).__name__}: {str(exc)[:200]}")
@@ -773,7 +976,14 @@ class HyperSkillGRPOTrainer:
                     gold_answers=item.gold_answers,
                 )
                 rec.update(f1=f1, response_tail=rollout["full_response"][-300:],
-                           rounds=len(rollout["response_list"]))
+                           rounds=len(rollout["response_list"]),
+                           end=rollout.get("end"), fail=rollout.get("fail"),
+                           response_full=rollout["full_response"],
+                           response_list=rollout["response_list"],
+                           finish=rollout.get("finish"), final_turn=rollout.get("final_turn", False))
+                for k in ("vote", "located_pages", "presearch", "video_timing"):
+                    if k in rollout:
+                        rec[k] = rollout[k]
                 per_question.append(rec)
                 return f1
 
@@ -808,6 +1018,11 @@ class HyperSkillGRPOTrainer:
             "errors": errors[:20],
             "skills_injected_per_question": n_injected,
             "frac_zero_skill": (sum(1 for n in n_injected if n == 0) / len(n_injected)) if n_injected else None,
+            "protocol_active": self.protocol.active if hcfg.protocol_skill else [],
+            "protocol_malformed_shapes": self.protocol.shapes,
+            "finish_reason_counts": _finish_counts(per_question),
+            "fail_counts": {k: sum(1 for r in per_question if r.get("fail") == k)
+                            for k in ("malformed_tool", "over_budget", "tool_without_tools", "no_answer")},
             "per_question": sorted(per_question, key=lambda r: r["idx"]),
             **self.skill_library.stats(),
         }
@@ -816,6 +1031,16 @@ class HyperSkillGRPOTrainer:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _finish_counts(per_question: List[Dict[str, Any]]) -> Dict[str, int]:
+    """finish_reason of the LAST LLM call of each question ("length" = truncated)."""
+    out: Dict[str, int] = {}
+    for r in per_question:
+        fin = r.get("finish") or []
+        k = str(fin[-1].get("finish_reason")) if fin else ("error" if r.get("error") else "none")
+        out[k] = out.get(k, 0) + 1
+    return out
 
 
 def _bootstrap_mean_std(scores: List[float], frac: float = 0.85,

@@ -33,6 +33,14 @@ You must respond in ONE of the following formats:
 Replace TOOL_TAG with one of the available tools listed above.
 """
 
+# Text tasks with the search tool (WebWalkerQA) get a concrete tool call
+# instead of the TOOL_TAG placeholder.
+SEARCH_AGENT_PROMPT_TEXT = SEARCH_AGENT_PROMPT.replace(
+    "    <TOOL_TAG>specific query</TOOL_TAG>\n\nReplace TOOL_TAG with one of the available tools listed above.\n",
+    "    <text_search>specific query</text_search>\n\nPut the search query itself between the <text_search> and "
+    "</text_search> tags.\n")
+assert SEARCH_AGENT_PROMPT_TEXT != SEARCH_AGENT_PROMPT
+
 # ---------------------------------------------------------------------------
 # Omni-modal agent prompt (Omni tasks — text + image + audio + video)
 # ---------------------------------------------------------------------------
@@ -190,9 +198,6 @@ Constraints for the hint: it must not change the required output format (the age
 SKILL_SUMMARY_SCHEMA_TOOLS = " It must not ask for more than {limit} tool calls in total, and the agent must always finish with a final <answer> even if a search did not find everything."
 
 # Injection variant (iii), tool-neutral hint (tool_neutral_hint=True, tool regimes)
-SKILL_SUMMARY_TOOL_NEUTRAL = """
-The hint must not tell the agent to search, look anything up or use any tool; focus only on how to reason about the given question and input and how to phrase the final answer."""
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -214,7 +219,9 @@ def build_initial_prompt(question: str, modality: str, tool_desc: str = "") -> s
     if modality == "omni":
         base = OMNI_AGENT_PROMPT.format(tool_desc=tool_desc)
     elif tool_desc:  # has tools → use search agent
-        base = SEARCH_AGENT_PROMPT.format(tool_desc=tool_desc)
+        tmpl = (SEARCH_AGENT_PROMPT_TEXT if modality == "text" and "<text_search>" in tool_desc
+                else SEARCH_AGENT_PROMPT)
+        base = tmpl.format(tool_desc=tool_desc)
     else:
         base = REASONING_PROMPT
     return base + f"\n\nHere is the question:\n{question}"

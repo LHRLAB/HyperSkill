@@ -1,0 +1,292 @@
+{
+ "_meta": {
+  "description": "Per-dataset HyperSkill settings of the main-table row. Each entry overrides the dataset's entry in hyperskill/configs/<modality>.yaml: library_run and train (library training on the 128 training questions), eval (evaluation on the test questions), seed (training order and LLM sampling seed).",
+  "backbone_model": "google/gemini-2.5-flash-lite",
+  "embedding_model": "google/gemini-embedding-2-preview",
+  "knowledge_search_model": "google/gemini-3.8-flash",
+  "api": {
+   "base_url": "https://openrouter.ai/api/v1",
+   "api_key_env": "OPENROUTER_API_KEY"
+  },
+  "data_dir": {
+   "env": "HYPERSKILL_DATA_DIR",
+   "default": "dataset"
+  },
+  "library_dir": "expr/<tag>_skill_library/<dataset>",
+  "output_dir": "outputs/<tag>_hyperskill_<dataset>",
+  "seed": 1,
+  "env": {
+   "HYPERSKILL_DISABLE_LLM_CACHE": "1",
+   "HYPERSKILL_DISABLE_SEARCH_CACHE": "1"
+  },
+  "scorer": "hyperskill/grpo/rewards_cjk.py (main table); hyperskill/grpo/rewards.py is the official scorer used by the harness"
+ },
+ "datasets": {
+  "AIME2024": {
+   "library_run": "R3",
+   "train": {
+    "hypergraph": {
+     "protocol_skill": true,
+     "concrete_tool_prompt": true,
+     "final_answer_turn": true,
+     "answer_suffix": true,
+     "tool_parse_lenient": true,
+     "doc_own_only": true
+    },
+    "rollout": {
+     "max_new_tokens": 8192,
+     "max_prompt_length": 16384
+    }
+   },
+   "eval": {
+    "hypergraph": {
+     "test_min_similarity": 9.0,
+     "protocol_skill": true,
+     "answer_suffix": true
+    },
+    "rollout": {
+     "max_new_tokens": 8192,
+     "max_prompt_length": 16384
+    }
+   },
+   "seed": 1,
+   "note": "PV-F: protocol skill + answer suffix, no retrieved skills (tau 9), 8192 new tokens"
+  },
+  "AIME2025": {
+   "library_run": "R3",
+   "train": {
+    "hypergraph": {
+     "protocol_skill": true,
+     "concrete_tool_prompt": true,
+     "final_answer_turn": true,
+     "answer_suffix": true,
+     "tool_parse_lenient": true,
+     "doc_own_only": true
+    },
+    "rollout": {
+     "max_new_tokens": 8192,
+     "max_prompt_length": 16384
+    }
+   },
+   "eval": {
+    "hypergraph": {
+     "test_min_similarity": 9.0,
+     "protocol_skill": false,
+     "answer_suffix": true,
+     "vote_k": 5
+    },
+    "rollout": {
+     "max_new_tokens": 8192,
+     "max_prompt_length": 16384
+    }
+   },
+   "seed": 1,
+   "note": "ZV-F+K5: answer suffix + self-consistency over 5 samples (T 0.7), no retrieved skills, 8192 new tokens"
+  },
+  "WebWalkerQA": {
+   "library_run": "R1",
+   "train": {
+    "hypergraph": {
+     "protocol_skill": true,
+     "concrete_tool_prompt": true,
+     "final_answer_turn": true,
+     "answer_suffix": true,
+     "tool_parse_lenient": true,
+     "doc_own_only": true
+    },
+    "rollout": {
+     "max_new_tokens": 4096,
+     "max_prompt_length": 16384
+    }
+   },
+   "eval": {
+    "hypergraph": {
+     "test_min_similarity": 9.0,
+     "protocol_skill": false,
+     "final_answer_turn": true,
+     "tool_parse_lenient": true,
+     "question_presearch": true
+    },
+    "rollout": {
+     "max_new_tokens": 4096,
+     "max_prompt_length": 16384
+    }
+   },
+   "seed": 1,
+   "note": "ZV-A+QP: final-answer turn + lenient tool parsing + question pre-search, no retrieved skills, 4096 new tokens"
+  },
+  "FVQA": {
+   "library_run": "R3",
+   "train": {
+    "hypergraph": {
+     "protocol_skill": true,
+     "concrete_tool_prompt": true,
+     "final_answer_turn": true,
+     "answer_suffix": true,
+     "tool_parse_lenient": true,
+     "doc_own_only": true
+    },
+    "rollout": {
+     "max_new_tokens": 4096,
+     "max_prompt_length": 24576
+    }
+   },
+   "eval": {
+    "hypergraph": {
+     "test_min_similarity": 9.0,
+     "protocol_skill": true,
+     "concrete_tool_prompt": true,
+     "final_answer_turn": true,
+     "tool_parse_lenient": true
+    }
+   },
+   "seed": 1,
+   "note": "PV-L: protocol skill + concrete tool prompt + final-answer turn + lenient tool parsing, no retrieved skills"
+  },
+  "InfoSeek": {
+   "library_run": "R1",
+   "train": {
+    "hypergraph": {
+     "protocol_skill": true
+    }
+   },
+   "eval": {
+    "hypergraph": {
+     "hub_correction": true,
+     "test_min_similarity": -0.02,
+     "answer_form_line": true,
+     "protocol_skill": true
+    }
+   },
+   "seed": 1,
+   "note": "DP: retrieved skills (hub-corrected tau -0.02, answer-form line) + protocol skill"
+  },
+  "SimpleVQA": {
+   "library_run": "R3",
+   "train": {
+    "hypergraph": {
+     "protocol_skill": true
+    }
+   },
+   "eval": {
+    "hypergraph": {
+     "schema_constrained_hint": true,
+     "test_min_similarity": 0.2,
+     "protocol_skill": true,
+     "vote_k": 5,
+     "vote_skip_refusals": true
+    }
+   },
+   "seed": 1,
+   "note": "SP20+V5: retrieved skills (tau 0.20, schema-constrained hint) + protocol skill + refusal-aware vote over 5 samples (T 0.7)"
+  },
+  "LiveVQA": {
+   "library_run": "R1",
+   "train": {
+    "hypergraph": {
+     "protocol_skill": true
+    }
+   },
+   "eval": {
+    "hypergraph": {
+     "test_min_similarity": 9.0,
+     "protocol_skill": true
+    }
+   },
+   "seed": 1,
+   "note": "P0: protocol skill, no retrieved skills"
+  },
+  "DocBench": {
+   "library_run": "R1",
+   "train": {
+    "hypergraph": {
+     "protocol_skill": true
+    }
+   },
+   "eval": {
+    "hypergraph": {
+     "test_min_similarity": 9.0,
+     "protocol_skill": true,
+     "protocol_answer_form": "data"
+    }
+   },
+   "seed": 1,
+   "note": "P0F: protocol skill with the data-derived answer form, no retrieved skills"
+  },
+  "MMLongBench-Doc": {
+   "library_run": "R3",
+   "train": {
+    "hypergraph": {
+     "protocol_skill": true
+    }
+   },
+   "eval": {
+    "hypergraph": {
+     "test_min_similarity": 9.0,
+     "protocol_skill": false,
+     "locate_pages": 4,
+     "final_answer_turn": true,
+     "concrete_tool_prompt": true,
+     "tool_parse_lenient": true
+    },
+    "rollout": {
+     "max_prompt_length": 16384
+    }
+   },
+   "seed": 1,
+   "note": "Z+LP+F+P2: top-4 located pages + final-answer turn + concrete tool prompt + lenient tool parsing, no retrieved skills"
+  },
+  "OmniVideoBench": {
+   "library_run": "R2",
+   "train": {
+    "hypergraph": {
+     "protocol_skill": true,
+     "concrete_tool_prompt": true,
+     "final_answer_turn": true,
+     "answer_suffix": true,
+     "tool_parse_lenient": true,
+     "doc_own_only": true
+    },
+    "rollout": {
+     "max_new_tokens": 4096,
+     "max_prompt_length": 32384
+    }
+   },
+   "eval": {
+    "hypergraph": {
+     "hint_synthesis": false,
+     "test_min_similarity": 0.55,
+     "protocol_skill": true,
+     "protocol_answer_form": "data",
+     "concrete_tool_prompt": true,
+     "final_answer_turn": true,
+     "answer_suffix": true
+    },
+    "rollout": {
+     "max_new_tokens": 4096,
+     "max_prompt_length": 32384
+    }
+   },
+   "seed": 1,
+   "note": "TPFV: retrieved skills (tau 0.55, terse) + protocol skill (data answer form) + concrete prompt + final-answer turn + answer suffix, 4096 new tokens"
+  },
+  "WorldSense": {
+   "library_run": "R1",
+   "train": {
+    "hypergraph": {
+     "protocol_skill": true
+    }
+   },
+   "eval": {
+    "hypergraph": {
+     "test_min_similarity": 9.0,
+     "protocol_skill": true,
+     "time_grounding": true,
+     "option_check": true
+    }
+   },
+   "seed": 1,
+   "note": "P0+TG+OE: protocol skill + video time grounding + option check, no retrieved skills (32 frames + audio, 4096 new tokens)"
+  }
+ }
+}
