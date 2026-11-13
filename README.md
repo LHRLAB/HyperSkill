@@ -1,6 +1,6 @@
 # HyperSkill
 
-HyperSkill: Training-Free Omnimodal GRPO via Hypergraph-Indexed Skill-Library Evolution
+Official resources of **"HyperSkill: Training-Free Omnimodal GRPO via Hypergraph-Indexed Skill-Library Evolution"**. Haoran Luo, Shangkai Lin, Jinyang Wu, Xinliang Zhou, Luu Anh Tuan. **NeurIPS 2026** \[[paper](https://arxiv.org/abs/2611.15178)\].
 
 ## Overview
 
