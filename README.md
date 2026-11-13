@@ -47,11 +47,14 @@ bash scripts/eval.sh
 If you find this work is helpful for your research, please cite:
 
 ```bibtex
-@inproceedings{luo2026hyperskill,
- author = {Luo, Haoran and Lin, Shangkai and Wu, Jinyang and Zhou, Xinliang and Luu, Anh Tuan},
- booktitle = {Advances in Neural Information Processing Systems},
- title = {HyperSkill: Training-Free Omnimodal GRPO via Hypergraph-Indexed Skill-Library Evolution},
- year = {2026}
+@misc{luo2026hyperskill,
+      title={HyperSkill: Training-Free Omnimodal GRPO via Hypergraph-Indexed Skill-Library Evolution}, 
+      author={Haoran Luo and Shangkai Lin and Jinyang Wu and Xinliang Zhou and Luu Anh Tuan},
+      year={2026},
+      eprint={2611.15178},
+      archivePrefix={arXiv},
+      primaryClass={cs.AI},
+      url={https://arxiv.org/abs/2611.15178}, 
 }
 ```
 
